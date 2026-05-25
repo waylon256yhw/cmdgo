@@ -5,8 +5,20 @@ on:
     tags:
       - 'v*'
 
+# contents:write → gh release create
+# packages:write → docker push ghcr.io/<repo>:<tag> (otherwise the
+# GITHUB_TOKEN is rejected with "installation not allowed to Create
+# organization package").
 permissions:
   contents: write
+  packages: write
+
+# Opt the docker/* family (setup-qemu, setup-buildx, login,
+# build-push) into Node 24 early — they don't yet ship Node 24-native
+# releases, but this env var forces the runner to use Node 24 anyway
+# and silences the deprecation warning.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   binaries:
