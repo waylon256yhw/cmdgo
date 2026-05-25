@@ -67,9 +67,10 @@ func run(args []string) error {
 		PublicURL: cfg.PublicURL,
 	}
 	openai := &proxy.OpenAIHandler{Store: st, CC: ccClient, Logger: logger}
+	anthropic := &proxy.AnthropicHandler{Store: st, CC: ccClient, Logger: logger}
 	models := &proxy.ModelsHandler{}
 
-	mux := newMux(st, oauth, openai, models)
+	mux := newMux(st, oauth, openai, anthropic, models)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -114,7 +115,7 @@ func run(args []string) error {
 	return nil
 }
 
-func newMux(st *store.Store, oauth *server.OAuthService, openai *proxy.OpenAIHandler, models *proxy.ModelsHandler) *http.ServeMux {
+func newMux(st *store.Store, oauth *server.OAuthService, openai *proxy.OpenAIHandler, anthropic *proxy.AnthropicHandler, models *proxy.ModelsHandler) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -124,11 +125,11 @@ func newMux(st *store.Store, oauth *server.OAuthService, openai *proxy.OpenAIHan
 
 	requireBearer := server.RequireProxyToken(st)
 
-	// /v1/* — proxy traffic. Chat completions are behind bearer; the
-	// models list is public so SDKs can introspect before they hold
-	// the proxy token.
+	// /v1/* — proxy traffic. Chat completions / messages are behind
+	// bearer; the models list is public so SDKs can introspect before
+	// they hold the proxy token.
 	mux.Handle("POST /v1/chat/completions", requireBearer(openai))
-	mux.Handle("POST /v1/messages", requireBearer(http.HandlerFunc(notImplemented)))
+	mux.Handle("POST /v1/messages", requireBearer(anthropic))
 	mux.Handle("GET /v1/models", models)
 
 	// /callback — public, CC Studio POSTs here from the user's browser.
@@ -140,10 +141,4 @@ func newMux(st *store.Store, oauth *server.OAuthService, openai *proxy.OpenAIHan
 	mux.Handle("POST /api/oauth/paste-key", requireBearer(http.HandlerFunc(oauth.HandlePasteKey)))
 
 	return mux
-}
-
-func notImplemented(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusNotImplemented)
-	_, _ = w.Write([]byte(`{"error":{"type":"not_implemented","message":"endpoint wiring lands in a later commit (M0 scaffold)"}}` + "\n"))
 }

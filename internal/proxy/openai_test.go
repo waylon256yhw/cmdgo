@@ -21,13 +21,13 @@ import (
 // finish payload. It also captures the raw request body so tests can
 // assert on cache_control / session id / message shape.
 type mockCCGenerate struct {
-	t            *testing.T
-	events       []string
-	failBefore   bool
-	failStatus   int
-	failBody     string
-	lastBody     []byte
-	lastHeaders  http.Header
+	t           *testing.T
+	events      []string
+	failBefore  bool
+	failStatus  int
+	failBody    string
+	lastBody    []byte
+	lastHeaders http.Header
 }
 
 func (m *mockCCGenerate) server() *httptest.Server {
@@ -155,10 +155,10 @@ func TestOpenAIHappyPathStream(t *testing.T) {
 	// Inspect what we sent upstream.
 	var sentBody struct {
 		Params struct {
-			Model        string             `json:"model"`
-			Messages     []json.RawMessage  `json:"messages"`
-			CacheControl *cc.CacheControl   `json:"cache_control"`
-			Stream       bool               `json:"stream"`
+			Model        string            `json:"model"`
+			Messages     []json.RawMessage `json:"messages"`
+			CacheControl *cc.CacheControl  `json:"cache_control"`
+			Stream       bool              `json:"stream"`
 		} `json:"params"`
 	}
 	if err := json.Unmarshal(mock.lastBody, &sentBody); err != nil {
@@ -203,7 +203,7 @@ func TestOpenAIPropagatesCCError(t *testing.T) {
 		t:          t,
 		failBefore: true,
 		failStatus: http.StatusForbidden,
-		failBody: `{"success":false,"error":{"code":"FORBIDDEN","status":403,"message":"MODEL_NOT_IN_PLAN: ..."}}`,
+		failBody:   `{"success":false,"error":{"code":"FORBIDDEN","status":403,"message":"MODEL_NOT_IN_PLAN: ..."}}`,
 	}
 	srv := mock.server()
 	defer srv.Close()
