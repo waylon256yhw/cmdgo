@@ -37,12 +37,11 @@
               hx-target="#account-{{.ID}}"
               hx-swap="outerHTML">Pause</button>
     {{end}}
-    <button class="btn btn-danger"
+    <button class="btn btn-danger flex-1"
             hx-delete="/api/accounts/{{.ID}}"
             hx-target="#account-{{.ID}}"
             hx-swap="delete"
             hx-confirm="Remove account {{.UserName}}? Stored apikey will be erased.">Remove</button>
   </div>
-  <div class="text-cmd-muted text-[10px] font-mono" title="{{.ID}}">id={{shortID .ID}}</div>
 </div>
 {{end}}

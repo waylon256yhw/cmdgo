@@ -151,15 +151,20 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	streamErr := streamCCToAnthropic(h.Logger, stream, sse, newAnthropicMessageID(), req.Model, &summary)
 	status := http.StatusOK
 	errCode := ""
-	if streamErr != nil {
+	switch {
+	case streamErr == nil:
+		if h.Runner != nil {
+			h.Runner.Pool.MarkSuccess(accID)
+		}
+	case clientGone(r, streamErr):
+		h.Logger.Info("anthropic client disconnected mid-stream", "account", accID)
+	default:
 		h.Logger.Warn("anthropic stream error", "err", streamErr, "account", accID)
 		status = http.StatusBadGateway
 		errCode = "stream_error"
 		if h.Runner != nil {
 			h.Runner.Pool.MarkError(accID)
 		}
-	} else if h.Runner != nil {
-		h.Runner.Pool.MarkSuccess(accID)
 	}
 	_ = h.Store.TouchAccountLastUsed(accID)
 	rec.RecordTraffic(store.TrafficEntry{

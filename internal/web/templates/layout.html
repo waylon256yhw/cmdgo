@@ -9,28 +9,107 @@
   <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
   <style type="text/tailwindcss">
     @theme {
-      --color-cmd-bg: #0a0b0e;
-      --color-cmd-panel: #111317;
-      --color-cmd-line: #1f232a;
-      --color-cmd-text: #e6e9ef;
-      --color-cmd-muted: #8a93a3;
+      /* Defaults are dark mode; html[data-theme="light"] swaps them. */
+      --color-cmd-bg: #0b0d12;
+      --color-cmd-panel: #14171e;
+      --color-cmd-inset: #1a1e27;
+      --color-cmd-line: #262b34;
+      --color-cmd-text: #e8ebf2;
+      --color-cmd-muted: #8b94a5;
       --color-cmd-accent: #6ee7b7;
+      --color-cmd-info: #93c5fd;
     }
-    body { @apply bg-cmd-bg text-cmd-text; }
-    .panel { @apply bg-cmd-panel rounded-lg border border-cmd-line; }
-    .chip { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium; }
-    button.btn { @apply inline-flex items-center gap-1 px-3 py-1.5 rounded text-sm font-medium border border-cmd-line bg-cmd-panel hover:border-cmd-accent transition; }
-    button.btn-primary { @apply bg-cmd-accent text-cmd-bg border-cmd-accent hover:bg-emerald-400; }
-    button.btn-danger:hover { @apply border-rose-500 text-rose-300; }
+    /* Light mode — slate-on-white palette. Accent shades shift to
+       deeper emerald/blue so the same button tokens keep AA contrast
+       against white text. */
+    html[data-theme="light"] {
+      --color-cmd-bg: #f8fafc;
+      --color-cmd-panel: #ffffff;
+      --color-cmd-inset: #f1f5f9;
+      --color-cmd-line: #e2e8f0;
+      --color-cmd-text: #0f172a;
+      --color-cmd-muted: #64748b;
+      --color-cmd-accent: #059669;
+      --color-cmd-info: #2563eb;
+    }
+    /* Body backdrop: faint coloured glows only in dark mode — they
+       disappear into the white in light mode anyway. */
+    body {
+      @apply bg-cmd-bg text-cmd-text;
+      background-image:
+        radial-gradient(ellipse 80% 60% at 0% 0%, rgba(110, 231, 183, 0.06), transparent 60%),
+        radial-gradient(ellipse 70% 60% at 100% 100%, rgba(147, 197, 253, 0.05), transparent 60%);
+    }
+    html[data-theme="light"] body {
+      background-image:
+        radial-gradient(ellipse 80% 60% at 0% 0%, rgba(5, 150, 105, 0.05), transparent 60%),
+        radial-gradient(ellipse 70% 60% at 100% 100%, rgba(37, 99, 235, 0.04), transparent 60%);
+    }
+    .panel { @apply bg-cmd-panel rounded-xl border border-cmd-line shadow-2xl shadow-black/30; }
+    .panel-inset { @apply bg-cmd-inset rounded-lg border border-cmd-line; }
+    .chip { @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium; }
+    button.btn, a.btn {
+      @apply inline-flex items-center justify-center gap-1.5
+             px-3.5 py-2 rounded-lg text-sm font-medium
+             border border-cmd-line bg-cmd-panel
+             hover:border-cmd-accent hover:bg-cmd-inset
+             transition cursor-pointer;
+    }
+    button.btn-primary, a.btn-primary {
+      @apply bg-cmd-accent text-cmd-bg border-cmd-accent font-semibold
+             hover:bg-emerald-400 hover:border-emerald-400
+             shadow-lg shadow-emerald-500/20;
+    }
+    button.btn-lg, a.btn-lg { @apply px-5 py-3 text-base; }
+    button.btn-danger:hover { @apply border-rose-500/80 text-rose-300 bg-rose-500/10; }
+    /* Numbered step pip — used in the Add Account modal for visual rhythm. */
+    .step-pip {
+      @apply inline-flex items-center justify-center
+             w-6 h-6 rounded-full
+             bg-cmd-inset border border-cmd-line
+             text-cmd-muted text-xs font-mono;
+    }
+    /* Light mode color recalibration for the few Tailwind shade
+       utilities we use in templates — the *-300 shades are tuned for
+       dark backgrounds and become invisible on white. We swap to the
+       matching *-700-ish tone in light mode. */
+    html[data-theme="light"] .text-emerald-300 { color: rgb(4 120 87); }
+    html[data-theme="light"] .text-emerald-200 { color: rgb(6 95 70); }
+    html[data-theme="light"] .text-sky-300     { color: rgb(3 105 161); }
+    html[data-theme="light"] .text-cyan-300    { color: rgb(14 116 144); }
+    html[data-theme="light"] .text-fuchsia-300 { color: rgb(162 28 175); }
+    html[data-theme="light"] .text-amber-100,
+    html[data-theme="light"] .text-amber-200,
+    html[data-theme="light"] .text-amber-300   { color: rgb(146 64 14); }
+    html[data-theme="light"] .text-rose-300    { color: rgb(190 18 60); }
+    /* Subtle pulsing dot to indicate "waiting on something". */
+    @keyframes cmd-pulse {
+      0%, 100% { opacity: 0.45; }
+      50%      { opacity: 1; }
+    }
+    .pulse-dot {
+      @apply inline-block w-2 h-2 rounded-full bg-cmd-accent;
+      animation: cmd-pulse 1.4s ease-in-out infinite;
+    }
   </style>
 
   <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/htmx-ext-sse@2.2.4"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.15.12/dist/cdn.min.js"></script>
 
   <link rel="stylesheet" href="/static/styles.css">
 
   <script>
+    // Hydrate theme BEFORE paint to avoid a dark-to-light flicker
+    // on light-mode reload. The button toggle persists the choice.
+    (function () {
+      try {
+        const t = localStorage.getItem('cmdgoTheme') || 'dark';
+        document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {
+        document.documentElement.setAttribute('data-theme', 'dark');
+      }
+    })();
+
     // Bootstrap the proxy token: prefer ?token=...; else localStorage;
     // else show the auth prompt. We strip the token from the URL once
     // captured so a bookmark doesn't leak it forever.
@@ -46,21 +125,17 @@
 
     function cmdgoToken() { return localStorage.getItem('cmdgoToken') || ''; }
 
-    // Inject the bearer into every HTMX request automatically.
-    document.body && document.body.addEventListener('htmx:configRequest', (e) => {
+    // Inject the bearer into every HTMX request. Listening on `document`
+    // (not `document.body`) so this attaches synchronously from the
+    // <head>, before HTMX scans the body and fires the first
+    // hx-trigger="load" requests on dashboard partials.
+    document.addEventListener('htmx:configRequest', (e) => {
       const t = cmdgoToken();
       if (t) e.detail.headers['Authorization'] = 'Bearer ' + t;
     });
-    // Pre-DOMContentLoaded path: re-bind once Alpine inits the body.
-    document.addEventListener('DOMContentLoaded', () => {
-      document.body.addEventListener('htmx:configRequest', (e) => {
-        const t = cmdgoToken();
-        if (t) e.detail.headers['Authorization'] = 'Bearer ' + t;
-      });
-    });
   </script>
 </head>
-<body class="min-h-screen" hx-ext="sse">
+<body class="min-h-screen">
   {{template "content" .}}
 </body>
 </html>

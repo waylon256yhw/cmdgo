@@ -64,12 +64,13 @@ func run(args []string) error {
 	dashboard := server.NewDashboardService(st, broadcaster, logger, cfg.Listen, cfg.PublicURL)
 
 	oauth := &server.OAuthService{
-		Store:     st,
-		CC:        ccClient,
-		States:    cc.NewStateStore(0),
-		Logger:    logger,
-		Listen:    cfg.Listen,
-		PublicURL: cfg.PublicURL,
+		Store:            st,
+		CC:               ccClient,
+		States:           cc.NewStateStore(0),
+		Logger:           logger,
+		Listen:           cfg.Listen,
+		PublicURL:        cfg.PublicURL,
+		OnAccountChanged: dashboard.BroadcastAccountSnapshot,
 	}
 	accPool := pool.New(st)
 	runner := &proxy.Runner{Pool: accPool, CC: ccClient, Logger: logger}

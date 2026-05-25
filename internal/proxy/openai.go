@@ -220,15 +220,24 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	streamErr := streamCCToOpenAI(h.Logger, stream, sse, id, req.Model, created, &summary)
 	status := http.StatusOK
 	errCode := ""
-	if streamErr != nil {
+	switch {
+	case streamErr == nil:
+		if h.Runner != nil {
+			h.Runner.Pool.MarkSuccess(accID)
+		}
+	case clientGone(r, streamErr):
+		// Client disconnected mid-stream (closed tab, ^C, etc.). Not
+		// the upstream account's fault — don't poison its rolling
+		// stats. We've already flushed bytes so the HTTP status stays
+		// 200 from the client's perspective.
+		h.Logger.Info("openai client disconnected mid-stream", "account", accID)
+	default:
 		h.Logger.Warn("openai stream error", "err", streamErr, "account", accID)
 		status = http.StatusBadGateway
 		errCode = "stream_error"
 		if h.Runner != nil {
 			h.Runner.Pool.MarkError(accID)
 		}
-	} else if h.Runner != nil {
-		h.Runner.Pool.MarkSuccess(accID)
 	}
 	_ = h.Store.TouchAccountLastUsed(accID)
 	rec.RecordTraffic(store.TrafficEntry{

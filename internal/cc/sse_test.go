@@ -61,6 +61,45 @@ func TestScannerFlushesUnterminatedFrameAtEOF(t *testing.T) {
 	}
 }
 
+func TestScannerHandlesJSONLines(t *testing.T) {
+	// CC's actual wire format: one JSON event per line, no `data:` prefix,
+	// no blank-line separator. We must accept it as readily as the
+	// SSE-framed form.
+	stream := `{"type":"start"}
+{"type":"reasoning-delta","text":"thinking"}
+{"type":"text-delta","text":"pong"}
+{"type":"finish","finishReason":"stop","totalUsage":{}}
+`
+	got := drainScanner(t, NewScanner(strings.NewReader(stream)))
+	wantTypes := []string{"start", "reasoning-delta", "text-delta", "finish"}
+	if len(got) != len(wantTypes) {
+		t.Fatalf("got %d events (%v), want %d", len(got), eventTypes(got), len(wantTypes))
+	}
+	for i, ev := range got {
+		if ev.Type != wantTypes[i] {
+			t.Errorf("event %d: type=%q, want %q", i, ev.Type, wantTypes[i])
+		}
+	}
+}
+
+func TestScannerMixedJSONLineAndSSE(t *testing.T) {
+	// A pathological mix — should still parse both shapes.
+	stream := ": keepalive\n" +
+		`{"type":"start"}` + "\n" +
+		"data: {\"type\":\"text-delta\",\"text\":\"hi\"}\n\n" +
+		`{"type":"finish"}` + "\n"
+	got := drainScanner(t, NewScanner(strings.NewReader(stream)))
+	wantTypes := []string{"start", "text-delta", "finish"}
+	if len(got) != len(wantTypes) {
+		t.Fatalf("got %d events (%v), want %d", len(got), eventTypes(got), len(wantTypes))
+	}
+	for i, ev := range got {
+		if ev.Type != wantTypes[i] {
+			t.Errorf("event %d: type=%q, want %q", i, ev.Type, wantTypes[i])
+		}
+	}
+}
+
 func TestScannerEmptyStream(t *testing.T) {
 	s := NewScanner(strings.NewReader(""))
 	ev, err := s.Next()

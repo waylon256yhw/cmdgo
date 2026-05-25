@@ -73,12 +73,18 @@ func (d *DashboardService) HandleIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	base := d.PublicURL
+	if base == "" {
+		base = "http://" + d.Listen
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	data := map[string]any{
-		"Title":    "dashboard",
-		"Listen":   d.Listen,
-		"DataPath": d.Store.Path(),
+		"Title":        "dashboard",
+		"Listen":       d.Listen,
+		"DataPath":     d.Store.Path(),
+		"Base":         base,
+		"DefaultModel": cc.DefaultGoModel,
 	}
 	if err := d.templates.ExecuteTemplate(w, "layout", data); err != nil {
 		d.Logger.Error("render dashboard", "err", err)
@@ -90,7 +96,12 @@ func (d *DashboardService) HandleAccounts(w http.ResponseWriter, r *http.Request
 	snap := d.Store.Snapshot()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if len(snap.Accounts) == 0 {
-		_, _ = w.Write([]byte(`<div class="col-span-full panel p-6 text-center text-cmd-muted">No accounts yet. Click <strong class="text-cmd-text">+ Paste apikey</strong> or <strong class="text-cmd-text">+ OAuth (local)</strong> to add one.</div>`))
+		_, _ = w.Write([]byte(`
+<div class="col-span-full panel p-10 text-center space-y-3">
+  <div class="text-3xl">🛰️</div>
+  <div class="text-cmd-text font-medium">No accounts yet</div>
+  <div class="text-cmd-muted text-sm">Click <strong class="text-cmd-text">+ Add account</strong> to sign in with Command Code.</div>
+</div>`))
 		return
 	}
 	for _, acc := range snap.Accounts {

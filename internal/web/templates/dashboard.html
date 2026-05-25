@@ -1,7 +1,7 @@
 {{define "content"}}
 <div x-data="dashboard()" x-init="ensureToken()" class="max-w-6xl mx-auto p-6 space-y-6">
-  <header class="flex items-center justify-between">
-    <div>
+  <header class="flex items-center justify-between gap-4">
+    <div class="min-w-0">
       <h1 class="text-2xl font-semibold tracking-tight flex items-center gap-2">
         <span class="text-cmd-accent">cmdgo</span>
         <span class="text-cmd-muted text-base font-normal">Command Code Go-tier reverse proxy</span>
@@ -11,9 +11,23 @@
         · Data <code class="text-cmd-text">{{.DataPath}}</code>
       </p>
     </div>
-    <div class="flex items-center gap-2">
-      <button class="btn" @click="copyToken()">Copy token</button>
-      <button class="btn" @click="rotateToken()">Rotate</button>
+    <div class="shrink-0">
+      <button class="btn !p-2"
+              @click="toggleTheme()"
+              x-bind:title="theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'"
+              aria-label="Toggle theme">
+        <!-- Sun (shown while in dark mode → clicking goes light) -->
+        <svg x-show="theme === 'dark'" class="w-5 h-5" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="4"/>
+          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+        </svg>
+        <!-- Moon (shown while in light mode → clicking goes dark) -->
+        <svg x-show="theme === 'light'" x-cloak class="w-5 h-5" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+        </svg>
+      </button>
     </div>
   </header>
 
@@ -33,24 +47,68 @@
   </div>
 
   <div x-show="hasToken" x-cloak class="space-y-6">
-    <!-- Endpoints -->
-    <section class="panel p-5"
-             hx-get="/api/endpoints"
-             hx-trigger="load"
-             hx-swap="innerHTML"></section>
+    <!-- Endpoints + token configuration -->
+    <section class="panel p-6 space-y-5">
+      <div class="flex items-center justify-between flex-wrap gap-2">
+        <h2 class="text-lg font-medium">Endpoints</h2>
+        <span class="chip bg-cmd-inset text-cmd-muted">Default model: <code class="text-cmd-text ml-1">{{.DefaultModel}}</code></span>
+      </div>
+
+      <div class="grid sm:grid-cols-2 gap-3">
+        <div class="panel-inset p-3 space-y-1 font-mono text-xs sm:text-sm">
+          <div class="text-cmd-muted text-xs uppercase tracking-wider font-sans">OpenAI compatible</div>
+          <div>POST&nbsp;<span class="text-cmd-accent break-all">{{.Base}}/v1/chat/completions</span></div>
+          <div>GET&nbsp;&nbsp;<span class="text-cmd-accent break-all">{{.Base}}/v1/models</span></div>
+        </div>
+        <div class="panel-inset p-3 space-y-1 font-mono text-xs sm:text-sm">
+          <div class="text-cmd-muted text-xs uppercase tracking-wider font-sans">Anthropic compatible</div>
+          <div>POST&nbsp;<span class="text-cmd-accent break-all">{{.Base}}/v1/messages</span></div>
+        </div>
+      </div>
+
+      <!-- Proxy token row -->
+      <div class="panel-inset p-4 space-y-3">
+        <div class="flex items-start justify-between gap-3 flex-wrap">
+          <div>
+            <div class="text-sm font-medium">Proxy token</div>
+            <div class="text-cmd-muted text-xs mt-0.5">
+              Paste this into your client's API-key field — works as both
+              <code class="text-cmd-text">Authorization: Bearer</code> and
+              <code class="text-cmd-text">x-api-key</code>.
+            </div>
+          </div>
+        </div>
+        <div class="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+          <input x-bind:type="tokenRevealed ? 'text' : 'password'"
+                 x-bind:value="cmdgoToken()"
+                 readonly
+                 @focus="$event.target.select()"
+                 class="flex-1 min-w-0 bg-cmd-bg border border-cmd-line rounded-lg px-3 py-2
+                        font-mono text-sm focus:outline-none focus:border-cmd-accent
+                        focus:ring-2 focus:ring-cmd-accent/30">
+          <button class="btn shrink-0" @click="tokenRevealed = !tokenRevealed"
+                  x-text="tokenRevealed ? 'Hide' : 'Reveal'"></button>
+          <button class="btn shrink-0" @click="copyToken()">Copy</button>
+          <button class="btn shrink-0 btn-danger"
+                  @click="rotateToken()"
+                  title="Generate a new token and invalidate the current one. All clients with the old token will be locked out.">
+            Rotate
+          </button>
+        </div>
+      </div>
+    </section>
 
     <!-- Accounts -->
     <section>
       <div class="flex items-center justify-between mb-3">
         <h2 class="text-lg font-medium">Accounts</h2>
         <div class="flex gap-2">
-          <button class="btn" @click="modal = 'paste'">+ Paste apikey</button>
-          <button class="btn" @click="modal = 'oauth'; startOAuth()">+ OAuth (local)</button>
+          <button class="btn btn-primary" @click="openAddModal()">+ Add account</button>
         </div>
       </div>
       <div id="accounts" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4"
            hx-get="/api/accounts"
-           hx-trigger="load, sse:account-update from:body"
+           hx-trigger="load"
            hx-swap="innerHTML"></div>
     </section>
 
@@ -78,64 +136,146 @@
           </thead>
           <tbody id="traffic"
                  hx-get="/api/traffic"
-                 hx-trigger="load, sse:traffic-row from:body, every 30s"
+                 hx-trigger="load, every 30s"
                  hx-swap="innerHTML"></tbody>
         </table>
       </div>
     </section>
   </div>
 
-  <!-- Paste-key modal -->
-  <div x-show="modal === 'paste'" x-cloak
-       class="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50"
-       @click.self="modal = null">
-    <div class="panel p-6 w-full max-w-lg space-y-4">
-      <h3 class="text-lg font-medium">Paste a Command Code apikey</h3>
-      <p class="text-cmd-muted text-sm">
-        Open <a class="text-cmd-accent underline" href="https://commandcode.ai/studio/auth/cli" target="_blank">commandcode.ai/studio/auth/cli</a>
-        in a browser, sign in, and copy the apikey (starts with <code>user_</code>).
-      </p>
-      <input type="password" x-model="pasteKey"
-             class="w-full bg-cmd-bg border border-cmd-line rounded px-3 py-2 font-mono text-sm"
-             placeholder="user_...">
-      <p x-show="pasteError" class="text-rose-300 text-sm" x-text="pasteError"></p>
-      <div class="flex justify-end gap-2">
-        <button class="btn" @click="modal = null">Cancel</button>
-        <button class="btn btn-primary" @click="submitPaste()">Add account</button>
+  <!-- Add account modal -->
+  <!--
+       One modal, two simultaneous paths. We always launch the OAuth
+       flow when the modal opens (callback URL is `http://localhost:
+       <port>/callback`, which CC Studio accepts). If the browser
+       can post to that URL (you're on the same machine as cmdgo, or
+       you SSH-tunneled the port), the account drops in
+       automatically. Otherwise CC Studio shows the apikey for the
+       user to copy — paste it here and it lands the same way. We
+       don't ask the user which environment they're in.
+    -->
+  <div x-show="modal === 'add'" x-cloak
+       class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50"
+       @click.self="closeAddModal()">
+    <div class="panel p-7 w-full max-w-2xl space-y-6">
+      <div class="flex items-start justify-between">
+        <div>
+          <h3 class="text-xl font-semibold tracking-tight">Add a Command Code account</h3>
+          <p class="text-cmd-muted text-sm mt-1.5">Sign in once. Either path below works — whichever finishes first wins.</p>
+        </div>
+        <button class="text-cmd-muted hover:text-cmd-text text-2xl leading-none -mt-1 -mr-1 px-2"
+                @click="closeAddModal()" aria-label="Close">×</button>
+      </div>
+
+      <!-- Step 1: open the OAuth URL -->
+      <div class="space-y-3">
+        <div class="flex items-center gap-2.5">
+          <span class="step-pip">1</span>
+          <span class="text-sm font-medium">Open Command Code, sign in, grant access</span>
+        </div>
+        <a x-bind:href="oauthURL"
+           x-bind:class="oauthURL ? '' : 'opacity-50 pointer-events-none'"
+           target="_blank"
+           class="btn btn-primary btn-lg w-full"
+           @click="addStarted = true">
+          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+            <polyline points="15 3 21 3 21 9"/>
+            <line x1="10" y1="14" x2="21" y2="3"/>
+          </svg>
+          Open Command Code
+        </a>
+      </div>
+
+      <!-- Step 2: two outcomes -->
+      <div class="space-y-3">
+        <div class="flex items-center gap-2.5">
+          <span class="step-pip">2</span>
+          <span class="text-sm font-medium">Either of these will land your account</span>
+        </div>
+
+        <!-- Outcome A: automatic via callback -->
+        <div class="panel-inset p-4 border-l-4 border-l-cmd-accent space-y-1.5">
+          <div class="flex items-center gap-2 text-sm font-medium">
+            <span x-show="addStarted" class="pulse-dot"></span>
+            <span x-show="!addStarted" class="w-2 h-2 rounded-full bg-cmd-muted/40 inline-block"></span>
+            <span>Automatic</span>
+            <span class="chip bg-emerald-500/15 text-emerald-300" x-show="addStarted">waiting…</span>
+          </div>
+          <p class="text-cmd-muted text-xs leading-relaxed">
+            Command Code posts the apikey back to
+            <code class="text-cmd-text bg-cmd-bg px-1.5 py-0.5 rounded" x-text="oauthCallback"></code>.
+            If your browser can reach that endpoint, the account drops in here and this dialog closes by itself.
+          </p>
+        </div>
+
+        <!-- Outcome B: manual paste -->
+        <div class="panel-inset p-4 border-l-4 border-l-cmd-info space-y-3">
+          <div class="flex items-center gap-2 text-sm font-medium">
+            <span class="w-2 h-2 rounded-full bg-cmd-info inline-block"></span>
+            <span>Manual paste</span>
+          </div>
+          <p class="text-cmd-muted text-xs leading-relaxed">
+            If Command Code shows the apikey on a page instead of redirecting
+            (typical when cmdgo isn't on your local machine), copy it and paste here:
+          </p>
+          <div class="flex gap-2">
+            <input type="password" x-model="pasteKey"
+                   class="flex-1 bg-cmd-bg border border-cmd-line rounded-lg px-3 py-2 font-mono text-sm
+                          focus:outline-none focus:border-cmd-info focus:ring-2 focus:ring-cmd-info/30"
+                   placeholder="user_..."
+                   @keydown.enter="submitPaste()">
+            <button class="btn shrink-0"
+                    x-bind:disabled="!pasteKey.startsWith('user_')"
+                    x-bind:class="pasteKey.startsWith('user_') ? 'btn-primary' : 'opacity-50 cursor-not-allowed'"
+                    @click="submitPaste()">Submit</button>
+          </div>
+          <p x-show="pasteError" class="text-rose-300 text-xs" x-text="pasteError"></p>
+        </div>
       </div>
     </div>
   </div>
 
-  <!-- OAuth modal -->
-  <div x-show="modal === 'oauth'" x-cloak
-       class="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50"
-       @click.self="modal = null">
-    <div class="panel p-6 w-full max-w-lg space-y-4">
-      <h3 class="text-lg font-medium">Sign in with Command Code</h3>
-      <p class="text-cmd-muted text-sm">
-        Click the button below to open Command Code in a new tab. After you grant
-        access, your browser POSTs the apikey back to <code x-text="oauthCallback"></code>.
-        Works for local listens only — on a VPS use paste-key instead.
-      </p>
-      <a x-bind:href="oauthURL" target="_blank" class="btn btn-primary inline-block">
-        Open Command Code →
-      </a>
-      <p class="text-cmd-muted text-xs">
-        The account will appear above once the callback lands. Waiting on state
-        <code class="font-mono" x-text="oauthState ? oauthState.slice(0, 8) + '…' : ''"></code>
-      </p>
-      <div class="flex justify-end">
-        <button class="btn" @click="modal = null">Close</button>
-      </div>
-    </div>
+  <!-- Toast (transient feedback for paste-key etc.) -->
+  <div x-show="toast" x-cloak x-transition
+       class="fixed bottom-6 right-6 panel px-4 py-3 shadow-xl border-l-4 z-50"
+       x-bind:class="toastKind === 'ok' ? 'border-l-cmd-accent' : 'border-l-rose-400'">
+    <div class="text-sm" x-text="toast"></div>
   </div>
-
-  <!-- SSE connect for the whole page -->
-  <div sse-connect="/api/events" sse-swap=":none" hx-vals="js:{token: cmdgoToken()}"></div>
 
 </div>
 
 <script>
+  // Open a single EventSource for the page lifetime, re-trigger HTMX
+  // re-fetches on account-update / traffic-row events. The auth token
+  // lives in localStorage, so we put it in the URL (EventSource has
+  // no way to set Authorization headers).
+  let _evt = null;
+  function startSSE() {
+    if (_evt) { try { _evt.close(); } catch (_) {} _evt = null; }
+    const tok = cmdgoToken();
+    if (!tok) return;
+    const url = '/api/events?token=' + encodeURIComponent(tok);
+    _evt = new EventSource(url);
+    _evt.addEventListener('account-update', () => {
+      const el = document.getElementById('accounts');
+      if (el) htmx.ajax('GET', '/api/accounts', { target: el, swap: 'innerHTML' });
+      // Tell the dashboard component an account just changed — used to
+      // auto-close the Add Account modal when the OAuth callback path
+      // lands on its own.
+      window.dispatchEvent(new CustomEvent('cmdgo:account-changed'));
+    });
+    _evt.addEventListener('traffic-row', () => {
+      const el = document.getElementById('traffic');
+      if (el) htmx.ajax('GET', '/api/traffic', { target: el, swap: 'innerHTML' });
+    });
+    _evt.onerror = () => {
+      // EventSource auto-reconnects, but on a hard 401 we want to bail
+      // out so the next user action re-triggers the open. Fail soft.
+    };
+  }
+  document.addEventListener('DOMContentLoaded', startSSE);
+
   function dashboard() {
     return {
       tokenInput: '',
@@ -146,13 +286,48 @@
       oauthURL: '',
       oauthCallback: '',
       oauthState: '',
+      addStarted: false,
+      tokenRevealed: false,
+      theme: document.documentElement.getAttribute('data-theme') || 'dark',
+      toast: '',
+      toastKind: 'ok',
+      _toastTimer: null,
+
+      toggleTheme() {
+        this.theme = this.theme === 'dark' ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-theme', this.theme);
+        try { localStorage.setItem('cmdgoTheme', this.theme); } catch (e) {}
+      },
+
+      init() {
+        // The SSE handler in <head> dispatches this whenever an account
+        // mutation lands. If the user has the Add Account modal open
+        // (because they kicked off OAuth), assume the callback path
+        // succeeded and close it.
+        window.addEventListener('cmdgo:account-changed', () => {
+          if (this.modal === 'add' && this.addStarted) {
+            this.flashToast('Account added via OAuth callback', 'ok');
+            this.closeAddModal();
+          }
+        });
+      },
 
       ensureToken() {
         this.hasToken = !!localStorage.getItem('cmdgoToken');
       },
+      flashToast(msg, kind) {
+        this.toast = msg;
+        this.toastKind = kind || 'ok';
+        if (this._toastTimer) clearTimeout(this._toastTimer);
+        this._toastTimer = setTimeout(() => { this.toast = ''; }, 3500);
+      },
+      reloadAccounts() {
+        const el = document.getElementById('accounts');
+        if (el) htmx.ajax('GET', '/api/accounts', { target: el, swap: 'innerHTML' });
+      },
       saveToken() {
         if (!this.tokenInput.startsWith('pcc_')) {
-          alert('Proxy token must start with pcc_');
+          this.flashToast('Proxy token must start with pcc_', 'err');
           return;
         }
         localStorage.setItem('cmdgoToken', this.tokenInput.trim());
@@ -161,6 +336,7 @@
       },
       copyToken() {
         navigator.clipboard.writeText(localStorage.getItem('cmdgoToken') || '');
+        this.flashToast('Token copied to clipboard', 'ok');
       },
       async rotateToken() {
         if (!confirm('Rotate the proxy token? All clients with the old token will be locked out.')) return;
@@ -168,19 +344,36 @@
           method: 'POST',
           headers: { 'Authorization': 'Bearer ' + cmdgoToken() },
         });
-        if (!resp.ok) { alert('Rotate failed: ' + resp.status); return; }
+        if (!resp.ok) { this.flashToast('Rotate failed: HTTP ' + resp.status, 'err'); return; }
         const data = await resp.json();
         localStorage.setItem('cmdgoToken', data.proxyToken);
         alert('New token (saved to this browser):\n\n' + data.proxyToken);
         location.reload();
       },
-      async startOAuth() {
+      openAddModal() {
+        this.modal = 'add';
+        this.pasteKey = '';
+        this.pasteError = '';
+        this.addStarted = false;
         this.oauthURL = '';
+        this.oauthCallback = '';
+        this.oauthState = '';
+        // Prefetch the OAuth URL + state so Step 1 button is live
+        // immediately. The state token lives 5min server-side; if the
+        // modal sits open longer than that, the user can just re-open
+        // the modal.
+        this.startOAuth();
+      },
+      closeAddModal() {
+        this.modal = null;
+        this.addStarted = false;
+      },
+      async startOAuth() {
         const resp = await fetch('/api/oauth/start', {
           method: 'POST',
           headers: { 'Authorization': 'Bearer ' + cmdgoToken() },
         });
-        if (!resp.ok) { alert('OAuth start failed: ' + resp.status); this.modal = null; return; }
+        if (!resp.ok) { this.flashToast('OAuth start failed: HTTP ' + resp.status, 'err'); return; }
         const data = await resp.json();
         this.oauthURL = data.authUrl;
         this.oauthCallback = data.callback;
@@ -188,6 +381,10 @@
       },
       async submitPaste() {
         this.pasteError = '';
+        if (!this.pasteKey.startsWith('user_')) {
+          this.pasteError = 'apikey must start with user_';
+          return;
+        }
         const resp = await fetch('/api/oauth/paste-key', {
           method: 'POST',
           headers: {
@@ -196,14 +393,19 @@
           },
           body: JSON.stringify({ apiKey: this.pasteKey.trim() }),
         });
+        const body = await resp.json().catch(() => ({}));
         if (!resp.ok) {
-          const body = await resp.json().catch(() => ({}));
           this.pasteError = (body.error && body.error.message) || ('HTTP ' + resp.status);
           return;
         }
+        const acc = body.account || {};
+        const verb = acc.created ? 'Added' : 'Refreshed';
+        const name = acc.userName || acc.name || acc.id || 'account';
+        const credits = (acc.lastKnownCredits != null) ? ' · $' + acc.lastKnownCredits.toFixed(4) + ' credits' : '';
+        this.flashToast(verb + ' ' + name + credits, 'ok');
         this.pasteKey = '';
-        this.modal = null;
-        htmx.trigger('#accounts', 'load');
+        this.closeAddModal();
+        this.reloadAccounts();
       },
     };
   }

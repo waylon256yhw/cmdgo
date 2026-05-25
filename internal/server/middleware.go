@@ -42,6 +42,15 @@ func extractProxyToken(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return h[len("Bearer "):]
 	}
+	// Anthropic-style clients (Cherry Studio, the official SDK in
+	// "messages" mode, etc.) send the key as `x-api-key`. Accept it
+	// transparently so the user doesn't have to configure two
+	// different auth modes in their client.
+	if h := r.Header.Get("x-api-key"); h != "" {
+		return h
+	}
+	// EventSource and other browser primitives that can't set headers
+	// can fall back to `?token=…` in the URL.
 	return r.URL.Query().Get("token")
 }
 

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/waylon256yhw/cmdgo/internal/cc"
@@ -224,6 +225,30 @@ func truncate(b []byte, n int) string {
 		return string(b)
 	}
 	return string(b[:n]) + "..."
+}
+
+// clientGone reports whether streamErr looks like a client-side
+// disconnect rather than an upstream / account problem. Used to avoid
+// poisoning a healthy account's rolling stats when the user just
+// closed their browser tab mid-stream.
+func clientGone(r *http.Request, streamErr error) bool {
+	if r != nil && r.Context().Err() != nil {
+		return true
+	}
+	if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
+		return true
+	}
+	// net/http surfaces client-side resets as "use of closed network
+	// connection" or "broken pipe" — these are string-typed; recognise
+	// the most common ones defensively.
+	msg := streamErr.Error()
+	switch {
+	case strings.Contains(msg, "broken pipe"),
+		strings.Contains(msg, "connection reset by peer"),
+		strings.Contains(msg, "use of closed network connection"):
+		return true
+	}
+	return false
 }
 
 // openAttempt runs Runner.Execute when the handler has one configured;

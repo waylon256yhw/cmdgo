@@ -16,10 +16,11 @@ type StreamEvent struct {
 	Raw  json.RawMessage
 }
 
-// Scanner reads SSE frames written by CC's `/alpha/generate`. CC only
-// emits `data: <json>\n\n` frames (no comments, no `event:`/`id:`/`retry:`
-// lines), so we focus on that shape but ignore unknown prefixes
-// defensively.
+// Scanner reads streamed events from CC's `/alpha/generate`. The wire
+// format in practice is **newline-delimited JSON** — one `{"type":...}`
+// per line — even though the Content-Type is `text/event-stream`. We
+// also accept proper SSE framing (`data: <json>\n\n`) so an upstream
+// switchover or a kept-alive `: ping` doesn't break us.
 type Scanner struct {
 	r       *bufio.Reader
 	dataBuf bytes.Buffer
@@ -78,6 +79,16 @@ func (s *Scanner) Next() (*StreamEvent, error) {
 					return nil, s.err
 				}
 				s.dataBuf.Write(payload)
+			case s.dataBuf.Len() == 0 && trimmed[0] == '{':
+				// Raw newline-delimited JSON: this is the actual format
+				// CC uses today, despite the SSE Content-Type. Each line
+				// is one complete event. Hand it to flush() immediately.
+				if len(trimmed) > scanBufMax {
+					s.err = errors.New("cc: JSONL frame exceeded scanBufMax")
+					return nil, s.err
+				}
+				s.dataBuf.Write(trimmed)
+				return s.flush()
 			default:
 				// Unknown field — ignore (event:, id:, retry: not used by CC).
 			}

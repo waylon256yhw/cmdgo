@@ -38,6 +38,12 @@ type OAuthService struct {
 	Logger    *slog.Logger
 	Listen    string // server bind, used to derive a fallback callback URL
 	PublicURL string // optional override for the OAuth callback URL
+
+	// OnAccountChanged is called after an account has been added or
+	// refreshed (paste-key or OAuth callback). main.go wires this to
+	// the dashboard so the new card lands in the DOM via SSE without
+	// the browser needing to re-poll.
+	OnAccountChanged func(accountID string)
 }
 
 // startResponse is the JSON body returned from POST /api/oauth/start.
@@ -242,19 +248,36 @@ func (s *OAuthService) addAccount(ctx context.Context, apikey string) (*store.Ac
 	if err != nil {
 		return nil, false, fmt.Errorf("persist account: %w", err)
 	}
+	if s.OnAccountChanged != nil {
+		s.OnAccountChanged(saved.ID)
+	}
 	return &saved, created, nil
 }
 
+// callbackURL is always built against `localhost` because CC Studio's
+// OAuth flow only accepts localhost-style callbacks (anything else is
+// rejected with "callback URL is invalid"). For VPS deployments the
+// browser reaches that localhost endpoint via an SSH tunnel — the
+// dashboard JS detects the situation and prints a copy-paste tunnel
+// command.
+//
+// If the operator explicitly sets --public-url to a localhost-style
+// URL (rare; useful in tests or weird reverse-proxy chains), we
+// honour it verbatim.
 func (s *OAuthService) callbackURL() string {
 	if s.PublicURL != "" {
-		return strings.TrimRight(s.PublicURL, "/") + "/callback"
+		if u, err := url.Parse(s.PublicURL); err == nil {
+			host := u.Hostname()
+			if host == "localhost" || host == "127.0.0.1" {
+				return strings.TrimRight(s.PublicURL, "/") + "/callback"
+			}
+		}
 	}
 	port := s.listenPort()
-	host := "localhost"
 	if port == "" {
-		return "http://localhost:8080/callback"
+		port = "8080"
 	}
-	return "http://" + net.JoinHostPort(host, port) + "/callback"
+	return "http://" + net.JoinHostPort("localhost", port) + "/callback"
 }
 
 func (s *OAuthService) listenPort() string {
