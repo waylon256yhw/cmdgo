@@ -25,6 +25,11 @@ type Config struct {
 	// reverse proxy / tunnel. Used to build OAuth callback URLs. Empty
 	// means "derive from Listen".
 	PublicURL string
+
+	// CCBaseURL overrides the Command Code API root. Defaults to the
+	// production URL embedded in cc.New. Mainly used by integration
+	// tests that point cmdgo at an httptest server.
+	CCBaseURL string
 }
 
 // Load parses args (typically os.Args[1:]) plus environment variables. The
@@ -34,6 +39,7 @@ func Load(args []string) (*Config, error) {
 	listen := fs.String("listen", envOr("CMDGO_LISTEN", "127.0.0.1:8080"), "listen address (host:port)")
 	dataPath := fs.String("data", envOr("CMDGO_DATA", defaultDataPath()), "JSON state file path")
 	publicURL := fs.String("public-url", envOr("CMDGO_PUBLIC_URL", ""), "public URL (when fronted by a reverse proxy)")
+	ccBaseURL := fs.String("cc-base-url", envOr("CMDGO_CC_BASE_URL", ""), "Command Code API base URL (override; testing only)")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -52,6 +58,7 @@ func Load(args []string) (*Config, error) {
 		Listen:    *listen,
 		DataPath:  abs,
 		PublicURL: *publicURL,
+		CCBaseURL: *ccBaseURL,
 	}, nil
 }
 

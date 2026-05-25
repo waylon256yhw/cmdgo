@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/waylon256yhw/cmdgo/internal/cc"
 	"github.com/waylon256yhw/cmdgo/internal/config"
 	"github.com/waylon256yhw/cmdgo/internal/server"
 	"github.com/waylon256yhw/cmdgo/internal/store"
@@ -51,7 +52,21 @@ func run(args []string) error {
 		fmt.Fprintf(os.Stderr, "cmdgo: proxy token loaded from %s\n", cfg.DataPath)
 	}
 
-	mux := newMux(st)
+	ccClient := cc.New()
+	if cfg.CCBaseURL != "" {
+		ccClient = cc.NewWithBaseURL(cfg.CCBaseURL)
+		logger.Info("cc base url override", "url", cfg.CCBaseURL)
+	}
+	oauth := &server.OAuthService{
+		Store:     st,
+		CC:        ccClient,
+		States:    cc.NewStateStore(0),
+		Logger:    logger,
+		Listen:    cfg.Listen,
+		PublicURL: cfg.PublicURL,
+	}
+
+	mux := newMux(st, oauth)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -96,7 +111,7 @@ func run(args []string) error {
 	return nil
 }
 
-func newMux(st *store.Store) *http.ServeMux {
+func newMux(st *store.Store, oauth *server.OAuthService) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -104,11 +119,21 @@ func newMux(st *store.Store) *http.ServeMux {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
-	v1Auth := server.RequireProxyToken(st)
-	mux.Handle("POST /v1/chat/completions", v1Auth(http.HandlerFunc(notImplemented)))
-	mux.Handle("POST /v1/messages", v1Auth(http.HandlerFunc(notImplemented)))
-	// /v1/models is public (clients introspect before authenticating).
+	requireBearer := server.RequireProxyToken(st)
+
+	// /v1/* — proxy traffic, behind bearer.
+	mux.Handle("POST /v1/chat/completions", requireBearer(http.HandlerFunc(notImplemented)))
+	mux.Handle("POST /v1/messages", requireBearer(http.HandlerFunc(notImplemented)))
+	// /v1/models is public; clients introspect before authenticating.
 	mux.HandleFunc("GET /v1/models", notImplemented)
+
+	// /callback — public, CC Studio POSTs here from the user's browser.
+	mux.HandleFunc("POST /callback", oauth.HandleOAuthCallback)
+	mux.HandleFunc("OPTIONS /callback", oauth.HandleOAuthPreflight)
+
+	// /api/oauth/* — dashboard-driven, behind bearer.
+	mux.Handle("POST /api/oauth/start", requireBearer(http.HandlerFunc(oauth.HandleOAuthStart)))
+	mux.Handle("POST /api/oauth/paste-key", requireBearer(http.HandlerFunc(oauth.HandlePasteKey)))
 
 	return mux
 }
