@@ -23,6 +23,10 @@ import (
 	"github.com/waylon256yhw/cmdgo/internal/store"
 )
 
+// version is set by the linker via -ldflags "-X main.version=..." in
+// release builds; otherwise reflects "dev".
+var version = "dev"
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "cmdgo: %v\n", err)
@@ -111,6 +115,7 @@ func run(args []string) error {
 	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("listening",
+			"version", version,
 			"addr", cfg.Listen,
 			"data", cfg.DataPath,
 		)

@@ -1,0 +1,31 @@
+# cmdgo — Command Code Go-tier reverse proxy
+#
+#   docker compose up -d
+#   docker compose logs cmdgo 2>&1 | grep pcc_   # grab the proxy token
+#
+# Behind a TLS-terminating reverse proxy:
+#   - set CMDGO_PUBLIC_URL to your external HTTPS URL
+#   - make sure the reverse proxy has proxy_buffering off for SSE
+#
+# Pin the image tag (e.g. v0.1.0) in production rather than :latest
+# so upgrades are explicit.
+
+services:
+  cmdgo:
+    image: ghcr.io/waylon256yhw/cmdgo:latest
+    container_name: cmdgo
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - cmdgo-data:/data
+    environment:
+      # CMDGO_LISTEN: "0.0.0.0:8080"          # default in image
+      # CMDGO_DATA: "/data/state.json"        # default in image
+      CMDGO_PUBLIC_URL: ""                    # set when behind TLS, e.g. https://cmdgo.example.com
+    # Optional: drop kernel caps cmdgo doesn't need.
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  cmdgo-data:
