@@ -32,6 +32,10 @@ vendor/
 *~
 .DS_Store
 
+# Local tooling / agent caches
+.serena/
+.claude/
+
 # cmdgo runtime data (never commit user state)
 state.json
 *.state.json
