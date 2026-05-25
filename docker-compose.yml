@@ -23,9 +23,17 @@ services:
       # CMDGO_LISTEN: "0.0.0.0:8080"          # default in image
       # CMDGO_DATA: "/data/state.json"        # default in image
       CMDGO_PUBLIC_URL: ""                    # set when behind TLS, e.g. https://cmdgo.example.com
-    # Optional: drop kernel caps cmdgo doesn't need.
+    # Drop kernel caps cmdgo doesn't need.
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
+    # Cap container log footprint to ~30 MiB (3 files × 10 MiB).
+    # Without this, every request line accumulates in
+    # /var/lib/docker/containers/<id>/<id>-json.log forever.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   cmdgo-data:
