@@ -1,0 +1,44 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/cmdgo
+/dist/
+
+# Test binary
+*.test
+
+# Coverage
+*.out
+coverage.txt
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependency vendor
+vendor/
+
+# Env
+.env
+.env.local
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# cmdgo runtime data (never commit user state)
+state.json
+*.state.json
+.cmdgo/
+~/.cmdgo/
+
+# Secrets
+*.key
+*.pem
+api-keys.txt
