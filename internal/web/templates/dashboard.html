@@ -1,0 +1,211 @@
+{{define "content"}}
+<div x-data="dashboard()" x-init="ensureToken()" class="max-w-6xl mx-auto p-6 space-y-6">
+  <header class="flex items-center justify-between">
+    <div>
+      <h1 class="text-2xl font-semibold tracking-tight flex items-center gap-2">
+        <span class="text-cmd-accent">cmdgo</span>
+        <span class="text-cmd-muted text-base font-normal">Command Code Go-tier reverse proxy</span>
+      </h1>
+      <p class="text-cmd-muted text-sm mt-1">
+        Listening on <code class="text-cmd-text">{{.Listen}}</code>
+        · Data <code class="text-cmd-text">{{.DataPath}}</code>
+      </p>
+    </div>
+    <div class="flex items-center gap-2">
+      <button class="btn" @click="copyToken()">Copy token</button>
+      <button class="btn" @click="rotateToken()">Rotate</button>
+    </div>
+  </header>
+
+  <!-- Token prompt -->
+  <div x-show="!hasToken" class="panel p-6 space-y-3">
+    <h2 class="text-lg font-medium">Paste your proxy token</h2>
+    <p class="text-cmd-muted text-sm">
+      The token (starting with <code>pcc_</code>) was printed when cmdgo started.
+      Paste it here to unlock the dashboard.
+    </p>
+    <div class="flex gap-2">
+      <input type="password" x-model="tokenInput"
+             class="flex-1 bg-cmd-bg border border-cmd-line rounded px-3 py-2 font-mono text-sm"
+             placeholder="pcc_...">
+      <button class="btn btn-primary" @click="saveToken()">Unlock</button>
+    </div>
+  </div>
+
+  <div x-show="hasToken" x-cloak class="space-y-6">
+    <!-- Endpoints -->
+    <section class="panel p-5"
+             hx-get="/api/endpoints"
+             hx-trigger="load"
+             hx-swap="innerHTML"></section>
+
+    <!-- Accounts -->
+    <section>
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-lg font-medium">Accounts</h2>
+        <div class="flex gap-2">
+          <button class="btn" @click="modal = 'paste'">+ Paste apikey</button>
+          <button class="btn" @click="modal = 'oauth'; startOAuth()">+ OAuth (local)</button>
+        </div>
+      </div>
+      <div id="accounts" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4"
+           hx-get="/api/accounts"
+           hx-trigger="load, sse:account-update from:body"
+           hx-swap="innerHTML"></div>
+    </section>
+
+    <!-- Traffic -->
+    <section>
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-lg font-medium">Traffic <span class="text-cmd-muted text-sm font-normal">(latest 50)</span></h2>
+        <span class="text-cmd-muted text-xs">live updates via SSE</span>
+      </div>
+      <div class="panel overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead class="text-cmd-muted text-xs uppercase tracking-wider">
+            <tr class="border-b border-cmd-line">
+              <th class="text-left px-4 py-2">When</th>
+              <th class="text-left px-2 py-2">Acct</th>
+              <th class="text-left px-2 py-2">Proto</th>
+              <th class="text-left px-2 py-2">Model</th>
+              <th class="text-left px-2 py-2">Status</th>
+              <th class="text-right px-2 py-2">In</th>
+              <th class="text-right px-2 py-2">Cache</th>
+              <th class="text-right px-2 py-2">Out</th>
+              <th class="text-right px-2 py-2">Cost</th>
+              <th class="text-right px-4 py-2">Dur</th>
+            </tr>
+          </thead>
+          <tbody id="traffic"
+                 hx-get="/api/traffic"
+                 hx-trigger="load, sse:traffic-row from:body, every 30s"
+                 hx-swap="innerHTML"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <!-- Paste-key modal -->
+  <div x-show="modal === 'paste'" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50"
+       @click.self="modal = null">
+    <div class="panel p-6 w-full max-w-lg space-y-4">
+      <h3 class="text-lg font-medium">Paste a Command Code apikey</h3>
+      <p class="text-cmd-muted text-sm">
+        Open <a class="text-cmd-accent underline" href="https://commandcode.ai/studio/auth/cli" target="_blank">commandcode.ai/studio/auth/cli</a>
+        in a browser, sign in, and copy the apikey (starts with <code>user_</code>).
+      </p>
+      <input type="password" x-model="pasteKey"
+             class="w-full bg-cmd-bg border border-cmd-line rounded px-3 py-2 font-mono text-sm"
+             placeholder="user_...">
+      <p x-show="pasteError" class="text-rose-300 text-sm" x-text="pasteError"></p>
+      <div class="flex justify-end gap-2">
+        <button class="btn" @click="modal = null">Cancel</button>
+        <button class="btn btn-primary" @click="submitPaste()">Add account</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- OAuth modal -->
+  <div x-show="modal === 'oauth'" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50"
+       @click.self="modal = null">
+    <div class="panel p-6 w-full max-w-lg space-y-4">
+      <h3 class="text-lg font-medium">Sign in with Command Code</h3>
+      <p class="text-cmd-muted text-sm">
+        Click the button below to open Command Code in a new tab. After you grant
+        access, your browser POSTs the apikey back to <code x-text="oauthCallback"></code>.
+        Works for local listens only — on a VPS use paste-key instead.
+      </p>
+      <a x-bind:href="oauthURL" target="_blank" class="btn btn-primary inline-block">
+        Open Command Code →
+      </a>
+      <p class="text-cmd-muted text-xs">
+        The account will appear above once the callback lands. Waiting on state
+        <code class="font-mono" x-text="oauthState ? oauthState.slice(0, 8) + '…' : ''"></code>
+      </p>
+      <div class="flex justify-end">
+        <button class="btn" @click="modal = null">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SSE connect for the whole page -->
+  <div sse-connect="/api/events" sse-swap=":none" hx-vals="js:{token: cmdgoToken()}"></div>
+
+</div>
+
+<script>
+  function dashboard() {
+    return {
+      tokenInput: '',
+      hasToken: !!localStorage.getItem('cmdgoToken'),
+      modal: null,
+      pasteKey: '',
+      pasteError: '',
+      oauthURL: '',
+      oauthCallback: '',
+      oauthState: '',
+
+      ensureToken() {
+        this.hasToken = !!localStorage.getItem('cmdgoToken');
+      },
+      saveToken() {
+        if (!this.tokenInput.startsWith('pcc_')) {
+          alert('Proxy token must start with pcc_');
+          return;
+        }
+        localStorage.setItem('cmdgoToken', this.tokenInput.trim());
+        this.hasToken = true;
+        location.reload();
+      },
+      copyToken() {
+        navigator.clipboard.writeText(localStorage.getItem('cmdgoToken') || '');
+      },
+      async rotateToken() {
+        if (!confirm('Rotate the proxy token? All clients with the old token will be locked out.')) return;
+        const resp = await fetch('/api/proxy-token/rotate', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + cmdgoToken() },
+        });
+        if (!resp.ok) { alert('Rotate failed: ' + resp.status); return; }
+        const data = await resp.json();
+        localStorage.setItem('cmdgoToken', data.proxyToken);
+        alert('New token (saved to this browser):\n\n' + data.proxyToken);
+        location.reload();
+      },
+      async startOAuth() {
+        this.oauthURL = '';
+        const resp = await fetch('/api/oauth/start', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + cmdgoToken() },
+        });
+        if (!resp.ok) { alert('OAuth start failed: ' + resp.status); this.modal = null; return; }
+        const data = await resp.json();
+        this.oauthURL = data.authUrl;
+        this.oauthCallback = data.callback;
+        this.oauthState = data.state;
+      },
+      async submitPaste() {
+        this.pasteError = '';
+        const resp = await fetch('/api/oauth/paste-key', {
+          method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + cmdgoToken(),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ apiKey: this.pasteKey.trim() }),
+        });
+        if (!resp.ok) {
+          const body = await resp.json().catch(() => ({}));
+          this.pasteError = (body.error && body.error.message) || ('HTTP ' + resp.status);
+          return;
+        }
+        this.pasteKey = '';
+        this.modal = null;
+        htmx.trigger('#accounts', 'load');
+      },
+    };
+  }
+</script>
+{{end}}

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/waylon256yhw/cmdgo/internal/cc"
 	"github.com/waylon256yhw/cmdgo/internal/store"
@@ -21,10 +22,11 @@ import (
 // message_stop). It shares the canonical runner with the OpenAI
 // adapter — only the wire format differs.
 type AnthropicHandler struct {
-	Store  *store.Store
-	CC     *cc.Client
-	Logger *slog.Logger
-	Runner *Runner
+	Store    *store.Store
+	CC       *cc.Client
+	Logger   *slog.Logger
+	Runner   *Runner
+	Recorder TrafficRecorder
 }
 
 type anthropicRequest struct {
@@ -116,9 +118,20 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
+	started := time.Now()
+	rec := h.recorder()
+
 	attempt, accID, err := openAttempt(ctx, h.Runner, h.Store, h.CC, h.Logger, canon)
 	if err != nil {
 		mapCCErrorToAnthropic(w, err)
+		rec.RecordTraffic(store.TrafficEntry{
+			AccountID:  accID,
+			Protocol:   "anthropic",
+			Model:      req.Model,
+			Status:     httpStatusFromErr(err, http.StatusBadGateway),
+			DurationMS: int(time.Since(started).Milliseconds()),
+			ErrorCode:  errorCodeFromErr(err),
+		})
 		return
 	}
 	defer attempt.Response.Body.Close()
@@ -134,17 +147,43 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stream := newPrefixedStream(attempt.FirstEvent, attempt.Scanner)
-	if err := streamCCToAnthropic(h.Logger, stream, sse, newAnthropicMessageID(), req.Model); err != nil {
-		h.Logger.Warn("anthropic stream error", "err", err, "account", accID)
+	var summary streamSummary
+	streamErr := streamCCToAnthropic(h.Logger, stream, sse, newAnthropicMessageID(), req.Model, &summary)
+	status := http.StatusOK
+	errCode := ""
+	if streamErr != nil {
+		h.Logger.Warn("anthropic stream error", "err", streamErr, "account", accID)
+		status = http.StatusBadGateway
+		errCode = "stream_error"
 		if h.Runner != nil {
 			h.Runner.Pool.MarkError(accID)
 		}
-		return
-	}
-	if h.Runner != nil {
+	} else if h.Runner != nil {
 		h.Runner.Pool.MarkSuccess(accID)
 	}
-	_ = affinity // affinity captured for future stats / dashboard tagging
+	_ = h.Store.TouchAccountLastUsed(accID)
+	rec.RecordTraffic(store.TrafficEntry{
+		AccountID:        accID,
+		Protocol:         "anthropic",
+		Model:            req.Model,
+		Status:           status,
+		InputTokens:      summary.InputTokens,
+		CacheReadTokens:  summary.CacheReadTokens,
+		CacheWriteTokens: summary.CacheWriteTokens,
+		OutputTokens:     summary.OutputTokens,
+		CostUSD:          computeCostUSD(req.Model, summary),
+		DurationMS:       int(time.Since(started).Milliseconds()),
+		Retried:          attempt.Retried,
+		ErrorCode:        errCode,
+	})
+	_ = affinity
+}
+
+func (h *AnthropicHandler) recorder() TrafficRecorder {
+	if h.Recorder == nil {
+		return nopRecorder{}
+	}
+	return h.Recorder
 }
 
 // anthState tracks which content block is currently open so we can emit
@@ -185,7 +224,7 @@ func (s *anthState) openBlock(sse *SSEWriter, typ string, init map[string]any) e
 	})
 }
 
-func streamCCToAnthropic(logger *slog.Logger, sc eventStream, sse *SSEWriter, msgID, model string) error {
+func streamCCToAnthropic(logger *slog.Logger, sc eventStream, sse *SSEWriter, msgID, model string, summary *streamSummary) error {
 	st := &anthState{}
 
 	emitMessageStart := func() error {
@@ -329,6 +368,15 @@ func streamCCToAnthropic(logger *slog.Logger, sc eventStream, sse *SSEWriter, ms
 					} `json:"totalUsage"`
 				}
 				_ = json.Unmarshal(ev.Raw, &pl)
+				if summary != nil {
+					summary.InputTokens = pl.TotalUsage.InputTokens
+					summary.OutputTokens = pl.TotalUsage.OutputTokens
+					summary.CacheReadTokens = pl.TotalUsage.InputTokenDetails.CacheReadTokens
+					summary.CacheWriteTokens = pl.TotalUsage.InputTokenDetails.CacheWriteTokens
+					summary.ReasoningTokens = pl.TotalUsage.OutputTokenDetails.ReasoningTokens
+					summary.FinishReason = pl.FinishReason
+					summary.Recorded = true
+				}
 				stop := anthropicStopReason(pl.FinishReason)
 				if werr := sse.WriteEvent("message_delta", map[string]any{
 					"type": "message_delta",

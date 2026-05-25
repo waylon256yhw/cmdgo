@@ -1,0 +1,18 @@
+{{define "traffic_row"}}
+<tr class="border-t border-cmd-line/60 hover:bg-cmd-line/30">
+  <td class="px-4 py-1.5 whitespace-nowrap text-cmd-muted">{{relTime .TS}}</td>
+  <td class="px-2 py-1.5 font-mono text-xs">{{shortID .AccountID}}</td>
+  <td class="px-2 py-1.5">
+    <span class="chip {{if eq .Protocol "openai"}}bg-cyan-500/20 text-cyan-300{{else}}bg-fuchsia-500/20 text-fuchsia-300{{end}}">{{.Protocol}}</span>
+  </td>
+  <td class="px-2 py-1.5 font-mono text-xs truncate max-w-[18ch]" title="{{.Model}}">{{.Model}}</td>
+  <td class="px-2 py-1.5">
+    <span class="chip {{statusCls .Status}}">{{if .Status}}{{.Status}}{{else}}---{{end}}</span>
+  </td>
+  <td class="px-2 py-1.5 text-right font-mono">{{tokens .InputTokens}}</td>
+  <td class="px-2 py-1.5 text-right font-mono text-cmd-muted">{{tokens .CacheReadTokens}}</td>
+  <td class="px-2 py-1.5 text-right font-mono">{{tokens .OutputTokens}}</td>
+  <td class="px-2 py-1.5 text-right font-mono">{{usd .CostUSD}}</td>
+  <td class="px-4 py-1.5 text-right font-mono text-cmd-muted">{{.DurationMS}}ms</td>
+</tr>
+{{end}}

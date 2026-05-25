@@ -23,10 +23,11 @@ import (
 // placeholder pick so the handler stays usable in unit tests that do
 // not exercise the retry path.
 type OpenAIHandler struct {
-	Store  *store.Store
-	CC     *cc.Client
-	Logger *slog.Logger
-	Runner *Runner
+	Store    *store.Store
+	CC       *cc.Client
+	Logger   *slog.Logger
+	Runner   *Runner
+	Recorder TrafficRecorder
 }
 
 // openaiRequest is what we actually look at from incoming JSON. Fields
@@ -184,9 +185,20 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
+	started := time.Now()
+	rec := h.recorder()
+
 	attempt, accID, err := openAttempt(ctx, h.Runner, h.Store, h.CC, h.Logger, canon)
 	if err != nil {
 		mapCCErrorToOpenAI(w, err)
+		rec.RecordTraffic(store.TrafficEntry{
+			AccountID:  accID,
+			Protocol:   "openai",
+			Model:      req.Model,
+			Status:     httpStatusFromErr(err, http.StatusBadGateway),
+			DurationMS: int(time.Since(started).Milliseconds()),
+			ErrorCode:  errorCodeFromErr(err),
+		})
 		return
 	}
 	defer attempt.Response.Body.Close()
@@ -204,19 +216,47 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	id := newCompletionID()
 	created := time.Now().Unix()
 	stream := newPrefixedStream(attempt.FirstEvent, attempt.Scanner)
-	if err := streamCCToOpenAI(h.Logger, stream, sse, id, req.Model, created); err != nil {
-		h.Logger.Warn("openai stream error", "err", err, "account", accID)
+	var summary streamSummary
+	streamErr := streamCCToOpenAI(h.Logger, stream, sse, id, req.Model, created, &summary)
+	status := http.StatusOK
+	errCode := ""
+	if streamErr != nil {
+		h.Logger.Warn("openai stream error", "err", streamErr, "account", accID)
+		status = http.StatusBadGateway
+		errCode = "stream_error"
 		if h.Runner != nil {
 			h.Runner.Pool.MarkError(accID)
 		}
-		return
-	}
-	if h.Runner != nil {
+	} else if h.Runner != nil {
 		h.Runner.Pool.MarkSuccess(accID)
 	}
+	_ = h.Store.TouchAccountLastUsed(accID)
+	rec.RecordTraffic(store.TrafficEntry{
+		AccountID:        accID,
+		Protocol:         "openai",
+		Model:            req.Model,
+		Status:           status,
+		InputTokens:      summary.InputTokens,
+		CacheReadTokens:  summary.CacheReadTokens,
+		CacheWriteTokens: summary.CacheWriteTokens,
+		OutputTokens:     summary.OutputTokens,
+		CostUSD:          computeCostUSD(req.Model, summary),
+		DurationMS:       int(time.Since(started).Milliseconds()),
+		Retried:          attempt.Retried,
+		ErrorCode:        errCode,
+	})
 }
 
-func streamCCToOpenAI(logger *slog.Logger, sc eventStream, sse *SSEWriter, id, model string, created int64) error {
+// recorder returns the configured TrafficRecorder or a no-op when
+// unset (tests).
+func (h *OpenAIHandler) recorder() TrafficRecorder {
+	if h.Recorder == nil {
+		return nopRecorder{}
+	}
+	return h.Recorder
+}
+
+func streamCCToOpenAI(logger *slog.Logger, sc eventStream, sse *SSEWriter, id, model string, created int64, summary *streamSummary) error {
 	sentRole := false
 	var toolIndex int
 
@@ -325,6 +365,15 @@ func streamCCToOpenAI(logger *slog.Logger, sc eventStream, sse *SSEWriter, id, m
 				}
 				_ = json.Unmarshal(ev.Raw, &pl)
 				fr := normalizeFinishReason(pl.FinishReason)
+				if summary != nil {
+					summary.InputTokens = pl.TotalUsage.InputTokens
+					summary.OutputTokens = pl.TotalUsage.OutputTokens
+					summary.CacheReadTokens = pl.TotalUsage.InputTokenDetails.CacheReadTokens
+					summary.CacheWriteTokens = pl.TotalUsage.InputTokenDetails.CacheWriteTokens
+					summary.ReasoningTokens = pl.TotalUsage.OutputTokenDetails.ReasoningTokens
+					summary.FinishReason = pl.FinishReason
+					summary.Recorded = true
+				}
 				usage := &openaiUsage{
 					PromptTokens:     pl.TotalUsage.InputTokens,
 					CompletionTokens: pl.TotalUsage.OutputTokens,
@@ -565,4 +614,37 @@ func newCompletionID() string {
 	var b [12]byte
 	_, _ = rand.Read(b[:])
 	return "chatcmpl-" + hex.EncodeToString(b[:])
+}
+
+// httpStatusFromErr extracts the HTTP status carried by *cc.APIError;
+// falls back to fallback for anything else (network failures, retry
+// budget exhausted, etc.).
+func httpStatusFromErr(err error, fallback int) int {
+	var ae *cc.APIError
+	if errors.As(err, &ae) && ae.HTTPStatus > 0 {
+		return ae.HTTPStatus
+	}
+	if errors.Is(err, ErrNoHealthyAccount) || errors.Is(err, poolErrNoHealthyAccount) {
+		return http.StatusServiceUnavailable
+	}
+	return fallback
+}
+
+// errorCodeFromErr returns a short machine-friendly code suitable for
+// the TrafficEntry.ErrorCode column.
+func errorCodeFromErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	var ae *cc.APIError
+	if errors.As(err, &ae) {
+		if ae.Body.Code != "" {
+			return strings.ToLower(ae.Body.Code)
+		}
+		return "upstream_error"
+	}
+	if errors.Is(err, ErrNoHealthyAccount) || errors.Is(err, poolErrNoHealthyAccount) {
+		return "no_account"
+	}
+	return "internal_error"
 }

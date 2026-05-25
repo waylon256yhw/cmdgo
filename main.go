@@ -59,6 +59,10 @@ func run(args []string) error {
 		ccClient = cc.NewWithBaseURL(cfg.CCBaseURL)
 		logger.Info("cc base url override", "url", cfg.CCBaseURL)
 	}
+
+	broadcaster := server.NewBroadcaster()
+	dashboard := server.NewDashboardService(st, broadcaster, logger, cfg.Listen, cfg.PublicURL)
+
 	oauth := &server.OAuthService{
 		Store:     st,
 		CC:        ccClient,
@@ -69,11 +73,11 @@ func run(args []string) error {
 	}
 	accPool := pool.New(st)
 	runner := &proxy.Runner{Pool: accPool, CC: ccClient, Logger: logger}
-	openai := &proxy.OpenAIHandler{Store: st, CC: ccClient, Logger: logger, Runner: runner}
-	anthropic := &proxy.AnthropicHandler{Store: st, CC: ccClient, Logger: logger, Runner: runner}
+	openai := &proxy.OpenAIHandler{Store: st, CC: ccClient, Logger: logger, Runner: runner, Recorder: dashboard}
+	anthropic := &proxy.AnthropicHandler{Store: st, CC: ccClient, Logger: logger, Runner: runner, Recorder: dashboard}
 	models := &proxy.ModelsHandler{}
 
-	mux := newMux(st, oauth, openai, anthropic, models)
+	mux := newMux(st, oauth, openai, anthropic, models, dashboard, broadcaster)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -87,6 +91,21 @@ func run(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Background credit poller — refreshes LastKnownCredits on each
+	// healthy account every Settings.CreditPollSec and pushes
+	// account-update events to the dashboard.
+	syncer := &pool.CreditSyncer{
+		Store:    st,
+		CC:       ccClient,
+		Logger:   logger,
+		OnUpdate: dashboard.BroadcastAccountSnapshot,
+	}
+	go func() {
+		if err := syncer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Warn("credit syncer exited", "err", err)
+		}
+	}()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -118,7 +137,15 @@ func run(args []string) error {
 	return nil
 }
 
-func newMux(st *store.Store, oauth *server.OAuthService, openai *proxy.OpenAIHandler, anthropic *proxy.AnthropicHandler, models *proxy.ModelsHandler) *http.ServeMux {
+func newMux(
+	st *store.Store,
+	oauth *server.OAuthService,
+	openai *proxy.OpenAIHandler,
+	anthropic *proxy.AnthropicHandler,
+	models *proxy.ModelsHandler,
+	dash *server.DashboardService,
+	broadcaster *server.Broadcaster,
+) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -142,6 +169,20 @@ func newMux(st *store.Store, oauth *server.OAuthService, openai *proxy.OpenAIHan
 	// /api/oauth/* — dashboard-driven, behind bearer.
 	mux.Handle("POST /api/oauth/start", requireBearer(http.HandlerFunc(oauth.HandleOAuthStart)))
 	mux.Handle("POST /api/oauth/paste-key", requireBearer(http.HandlerFunc(oauth.HandlePasteKey)))
+
+	// Dashboard HTMX partials + REST.
+	mux.HandleFunc("GET /{$}", dash.HandleIndex)
+	mux.Handle("GET /api/accounts", requireBearer(http.HandlerFunc(dash.HandleAccounts)))
+	mux.Handle("GET /api/traffic", requireBearer(http.HandlerFunc(dash.HandleTraffic)))
+	mux.Handle("GET /api/endpoints", requireBearer(http.HandlerFunc(dash.HandleEndpoints)))
+	mux.Handle("POST /api/accounts/{id}/pause", requireBearer(http.HandlerFunc(dash.HandlePauseAccount)))
+	mux.Handle("POST /api/accounts/{id}/resume", requireBearer(http.HandlerFunc(dash.HandleResumeAccount)))
+	mux.Handle("DELETE /api/accounts/{id}", requireBearer(http.HandlerFunc(dash.HandleDeleteAccount)))
+	mux.Handle("POST /api/proxy-token/rotate", requireBearer(http.HandlerFunc(dash.HandleRotateToken)))
+
+	// Static files (CSS) and SSE event stream.
+	mux.Handle("GET /static/", dash.StaticFileServer())
+	mux.Handle("GET /api/events", requireBearer(http.HandlerFunc(broadcaster.ServeSSE)))
 
 	return mux
 }

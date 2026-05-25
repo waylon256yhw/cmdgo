@@ -16,18 +16,18 @@ import (
 )
 
 // RequireProxyToken returns a middleware that gates a handler behind the
-// proxy token persisted in state.json. Expect `Authorization: Bearer
-// pcc_...`; anything else is 401.
+// proxy token persisted in state.json. The token may arrive either in
+// `Authorization: Bearer pcc_...` (preferred) or as a `?token=...`
+// query parameter (used for SSE connections from EventSource, which
+// can't set custom headers).
 func RequireProxyToken(s *store.Store) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			h := r.Header.Get("Authorization")
-			const prefix = "Bearer "
-			if !strings.HasPrefix(h, prefix) {
+			got := extractProxyToken(r)
+			if got == "" {
 				writeAuthError(w, "missing_authorization", "missing or malformed Authorization header")
 				return
 			}
-			got := h[len(prefix):]
 			want := s.Snapshot().ProxyToken
 			if want == "" || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
 				writeAuthError(w, "invalid_token", "proxy token did not match the value in state.json")
@@ -36,6 +36,13 @@ func RequireProxyToken(s *store.Store) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func extractProxyToken(r *http.Request) string {
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		return h[len("Bearer "):]
+	}
+	return r.URL.Query().Get("token")
 }
 
 func writeAuthError(w http.ResponseWriter, code, msg string) {

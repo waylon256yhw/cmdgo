@@ -1,0 +1,48 @@
+{{define "account_card"}}
+<div class="panel p-4 space-y-3" id="account-{{.ID}}">
+  <div class="flex items-start justify-between gap-2">
+    <div class="min-w-0">
+      <div class="font-medium truncate">{{.Name}}</div>
+      <div class="text-cmd-muted text-xs truncate">{{.UserName}} · {{.Email}}</div>
+    </div>
+    {{if .Paused}}
+      <span class="chip bg-amber-500/20 text-amber-300">paused</span>
+    {{else}}
+      <span class="chip bg-emerald-500/20 text-emerald-300">active</span>
+    {{end}}
+  </div>
+
+  <div>
+    <div class="flex items-baseline justify-between text-sm">
+      <span class="text-cmd-muted">Credits</span>
+      <span class="font-mono">${{printf "%.4f" .LastKnownCredits}}</span>
+    </div>
+    <div class="h-1.5 mt-1 rounded bg-cmd-bg overflow-hidden">
+      <div class="h-full bg-cmd-accent" style="width: {{.CreditsPct}}%"></div>
+    </div>
+    <div class="text-cmd-muted text-xs mt-1">
+      Last sync {{relTime .LastKnownCreditsAt}} · Last used {{relTime .LastUsedAt}}
+    </div>
+  </div>
+
+  <div class="flex gap-2 text-sm">
+    {{if .Paused}}
+      <button class="btn flex-1"
+              hx-post="/api/accounts/{{.ID}}/resume"
+              hx-target="#account-{{.ID}}"
+              hx-swap="outerHTML">Resume</button>
+    {{else}}
+      <button class="btn flex-1"
+              hx-post="/api/accounts/{{.ID}}/pause"
+              hx-target="#account-{{.ID}}"
+              hx-swap="outerHTML">Pause</button>
+    {{end}}
+    <button class="btn btn-danger"
+            hx-delete="/api/accounts/{{.ID}}"
+            hx-target="#account-{{.ID}}"
+            hx-swap="delete"
+            hx-confirm="Remove account {{.UserName}}? Stored apikey will be erased.">Remove</button>
+  </div>
+  <div class="text-cmd-muted text-[10px] font-mono" title="{{.ID}}">id={{shortID .ID}}</div>
+</div>
+{{end}}

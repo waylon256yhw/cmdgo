@@ -1,0 +1,12 @@
+/* Custom rules that aren't worth a Tailwind utility. The CDN build
+   covers everything else. */
+
+[x-cloak] { display: none !important; }
+
+/* Smooth fade-in when HTMX swaps in fresh fragments. */
+.htmx-added { opacity: 0; }
+.htmx-swapping { opacity: 0; transition: opacity 120ms ease-out; }
+.htmx-settling { opacity: 1; transition: opacity 120ms ease-in; }
+
+/* Code-style font fallback. */
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Mono", monospace; }

@@ -6,7 +6,14 @@
 // crashes. A single RWMutex serialises in-process access.
 package store
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+// ErrAccountNotFound is returned by mutating operations that name a
+// missing account.
+var ErrAccountNotFound = errors.New("store: account not found")
 
 // StateVersion is the schema version written into state.json. Bumped when
 // fields change shape, never for additive changes.
