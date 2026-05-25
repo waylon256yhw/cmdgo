@@ -17,6 +17,7 @@ import (
 
 	"github.com/waylon256yhw/cmdgo/internal/cc"
 	"github.com/waylon256yhw/cmdgo/internal/config"
+	"github.com/waylon256yhw/cmdgo/internal/proxy"
 	"github.com/waylon256yhw/cmdgo/internal/server"
 	"github.com/waylon256yhw/cmdgo/internal/store"
 )
@@ -65,8 +66,10 @@ func run(args []string) error {
 		Listen:    cfg.Listen,
 		PublicURL: cfg.PublicURL,
 	}
+	openai := &proxy.OpenAIHandler{Store: st, CC: ccClient, Logger: logger}
+	models := &proxy.ModelsHandler{}
 
-	mux := newMux(st, oauth)
+	mux := newMux(st, oauth, openai, models)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -111,7 +114,7 @@ func run(args []string) error {
 	return nil
 }
 
-func newMux(st *store.Store, oauth *server.OAuthService) *http.ServeMux {
+func newMux(st *store.Store, oauth *server.OAuthService, openai *proxy.OpenAIHandler, models *proxy.ModelsHandler) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -121,11 +124,12 @@ func newMux(st *store.Store, oauth *server.OAuthService) *http.ServeMux {
 
 	requireBearer := server.RequireProxyToken(st)
 
-	// /v1/* — proxy traffic, behind bearer.
-	mux.Handle("POST /v1/chat/completions", requireBearer(http.HandlerFunc(notImplemented)))
+	// /v1/* — proxy traffic. Chat completions are behind bearer; the
+	// models list is public so SDKs can introspect before they hold
+	// the proxy token.
+	mux.Handle("POST /v1/chat/completions", requireBearer(openai))
 	mux.Handle("POST /v1/messages", requireBearer(http.HandlerFunc(notImplemented)))
-	// /v1/models is public; clients introspect before authenticating.
-	mux.HandleFunc("GET /v1/models", notImplemented)
+	mux.Handle("GET /v1/models", models)
 
 	// /callback — public, CC Studio POSTs here from the user's browser.
 	mux.HandleFunc("POST /callback", oauth.HandleOAuthCallback)
