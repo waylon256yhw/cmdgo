@@ -146,6 +146,14 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// See the matching comment in openai.go's ServeHTTP: post-flush
+	// errors (mid-stream upstream hiccup, client disconnect) must not
+	// feed Pool.MarkError. The retry.Runner already handles pre-flush
+	// account-level failures.
+	if h.Runner != nil {
+		h.Runner.Pool.MarkSuccess(accID)
+	}
+
 	stream := newPrefixedStream(attempt.FirstEvent, attempt.Scanner)
 	var summary streamSummary
 	streamErr := streamCCToAnthropic(h.Logger, stream, sse, newAnthropicMessageID(), req.Model, &summary)
@@ -153,18 +161,13 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	errCode := ""
 	switch {
 	case streamErr == nil:
-		if h.Runner != nil {
-			h.Runner.Pool.MarkSuccess(accID)
-		}
+		// nothing more to do
 	case clientGone(r, streamErr):
 		h.Logger.Info("anthropic client disconnected mid-stream", "account", accID)
 	default:
 		h.Logger.Warn("anthropic stream error", "err", streamErr, "account", accID)
 		status = http.StatusBadGateway
 		errCode = "stream_error"
-		if h.Runner != nil {
-			h.Runner.Pool.MarkError(accID)
-		}
 	}
 	_ = h.Store.TouchAccountLastUsed(accID)
 	rec.RecordTraffic(store.TrafficEntry{

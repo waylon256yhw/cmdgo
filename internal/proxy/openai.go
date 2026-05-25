@@ -213,6 +213,24 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Mark success the moment we have a healthy upstream attempt with
+	// at least one event ready. The apikey is proven valid; the
+	// account is proven reachable. Anything that goes wrong from
+	// here on out — CC emitting a mid-stream `error` frame with
+	// isRetryable:true, the upstream TCP dying, the client closing
+	// its end — is NOT a signal that this account is unhealthy, and
+	// must not feed Pool.MarkError. Single-account deployments
+	// otherwise lose the only account to the rolling-stats threshold
+	// the first time CC has a hiccup.
+	//
+	// Pre-flush failures (bad apikey, plan-locked model, retry budget
+	// exhausted) are handled at the retry.Runner level — those DO
+	// MarkError because they're the legitimate "this apikey is
+	// broken" signal.
+	if h.Runner != nil {
+		h.Runner.Pool.MarkSuccess(accID)
+	}
+
 	id := newCompletionID()
 	created := time.Now().Unix()
 	stream := newPrefixedStream(attempt.FirstEvent, attempt.Scanner)
@@ -222,22 +240,13 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	errCode := ""
 	switch {
 	case streamErr == nil:
-		if h.Runner != nil {
-			h.Runner.Pool.MarkSuccess(accID)
-		}
+		// nothing more to do
 	case clientGone(r, streamErr):
-		// Client disconnected mid-stream (closed tab, ^C, etc.). Not
-		// the upstream account's fault — don't poison its rolling
-		// stats. We've already flushed bytes so the HTTP status stays
-		// 200 from the client's perspective.
 		h.Logger.Info("openai client disconnected mid-stream", "account", accID)
 	default:
 		h.Logger.Warn("openai stream error", "err", streamErr, "account", accID)
 		status = http.StatusBadGateway
 		errCode = "stream_error"
-		if h.Runner != nil {
-			h.Runner.Pool.MarkError(accID)
-		}
 	}
 	_ = h.Store.TouchAccountLastUsed(accID)
 	rec.RecordTraffic(store.TrafficEntry{

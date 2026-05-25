@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/waylon256yhw/cmdgo/internal/cc"
+	"github.com/waylon256yhw/cmdgo/internal/pool"
 	"github.com/waylon256yhw/cmdgo/internal/store"
 )
 
@@ -348,3 +349,75 @@ func statusString(p *string) string {
 }
 
 var _ = statusString // keep available for ad-hoc test debugging
+
+// TestOpenAIMidStreamErrorDoesNotPoisonAccount reproduces the
+// production bug seen against real CC: upstream sometimes emits a
+// `{"type":"error","error":{...,"isRetryable":true}}` event after
+// we've already started flushing to the client. Old behaviour was
+// to count this as a stream error and MarkError on the account,
+// which — with a single-account deployment — instantly tripped the
+// 20% rolling error-rate threshold and rejected the next request
+// with 503 no_account.
+//
+// Fix: post-flush errors no longer touch the account's rolling
+// stats. retry.Runner alone is responsible for MarkError on
+// pre-flush failures.
+func TestOpenAIMidStreamErrorDoesNotPoisonAccount(t *testing.T) {
+	mock := &mockCCGenerate{t: t, events: []string{
+		`{"type":"start"}`,
+		`{"type":"text-delta","text":"hi"}`,
+		// Mid-stream upstream error matching what production CC sent.
+		`{"type":"error","error":{"type":"server_error","message":"Service temporarily unavailable. Please try again shortly.","statusCode":503,"isRetryable":true}}`,
+	}}
+	srv := mock.server()
+	defer srv.Close()
+
+	st, err := store.New(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Update(func(s *store.State) error {
+		s.Accounts = append(s.Accounts, store.Account{
+			ID:               "only-account",
+			APIKey:           "user_only1234567890",
+			AddedAt:          time.Now(),
+			LastKnownCredits: 9.99,
+		})
+		return nil
+	})
+
+	p := pool.New(st)
+	ccClient := cc.NewWithBaseURL(srv.URL)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := &OpenAIHandler{
+		Store:  st,
+		CC:     ccClient,
+		Logger: logger,
+		Runner: &Runner{Pool: p, CC: ccClient, Logger: logger},
+	}
+
+	reqBody := `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer pcc_test")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	reqs, errs := p.Stats("only-account")
+	if reqs == 0 {
+		t.Errorf("MarkSuccess never ran: reqs=%d", reqs)
+	}
+	if errs != 0 {
+		t.Errorf("mid-stream error poisoned account stats: reqs=%d errs=%d", reqs, errs)
+	}
+
+	// Account should still be pickable for a follow-up request — the
+	// real symptom of the bug was that the very next call returned
+	// 503 no_account.
+	if _, err := p.Pick(pool.PickOptions{ClientToken: "tok", Model: "deepseek/deepseek-v4-pro"}); err != nil {
+		t.Errorf("Pool.Pick rejected the only account after a mid-stream error: %v", err)
+	}
+}
