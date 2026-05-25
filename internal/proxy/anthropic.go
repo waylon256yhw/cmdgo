@@ -24,6 +24,7 @@ type AnthropicHandler struct {
 	Store  *store.Store
 	CC     *cc.Client
 	Logger *slog.Logger
+	Runner *Runner
 }
 
 type anthropicRequest struct {
@@ -105,36 +106,26 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Protocol:    "anthropic",
 	}
 
-	acc, err := pickAccount(h.Store)
-	if err != nil {
-		writeAnthropicError(w, http.StatusServiceUnavailable, "no_account", err.Error())
-		return
-	}
-
-	body := BuildCCBody(canon)
-	sid := SessionID(affinity, canon.Model, MessagesPrefix(canon.Messages))
-
 	ignored := collectIgnoredAnthropicFields(&req)
 	if len(ignored) > 0 {
 		w.Header().Set("x-cmdgo-ignored", strings.Join(ignored, ","))
 	}
-	w.Header().Set("x-cmdgo-account-id", acc.ID)
 	w.Header().Set("x-cmdgo-protocol", "anthropic")
 	w.Header().Set("x-cmdgo-model", req.Model)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	resp, err := h.CC.Generate(ctx, cc.GenerateOpts{
-		APIKey:    acc.APIKey,
-		SessionID: sid,
-		Body:      body,
-	})
+	attempt, accID, err := openAttempt(ctx, h.Runner, h.Store, h.CC, h.Logger, canon)
 	if err != nil {
 		mapCCErrorToAnthropic(w, err)
 		return
 	}
-	defer resp.Body.Close()
+	defer attempt.Response.Body.Close()
+	w.Header().Set("x-cmdgo-account-id", accID)
+	if attempt.Retried {
+		w.Header().Set("x-cmdgo-retried", "true")
+	}
 
 	sse, err := NewSSEWriter(w)
 	if err != nil {
@@ -142,9 +133,18 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := streamCCToAnthropic(h.Logger, cc.NewScanner(resp.Body), sse, newAnthropicMessageID(), req.Model); err != nil {
-		h.Logger.Warn("anthropic stream error", "err", err, "account", acc.ID)
+	stream := newPrefixedStream(attempt.FirstEvent, attempt.Scanner)
+	if err := streamCCToAnthropic(h.Logger, stream, sse, newAnthropicMessageID(), req.Model); err != nil {
+		h.Logger.Warn("anthropic stream error", "err", err, "account", accID)
+		if h.Runner != nil {
+			h.Runner.Pool.MarkError(accID)
+		}
+		return
 	}
+	if h.Runner != nil {
+		h.Runner.Pool.MarkSuccess(accID)
+	}
+	_ = affinity // affinity captured for future stats / dashboard tagging
 }
 
 // anthState tracks which content block is currently open so we can emit
@@ -185,7 +185,7 @@ func (s *anthState) openBlock(sse *SSEWriter, typ string, init map[string]any) e
 	})
 }
 
-func streamCCToAnthropic(logger *slog.Logger, sc *cc.Scanner, sse *SSEWriter, msgID, model string) error {
+func streamCCToAnthropic(logger *slog.Logger, sc eventStream, sse *SSEWriter, msgID, model string) error {
 	st := &anthState{}
 
 	emitMessageStart := func() error {
@@ -643,6 +643,10 @@ func writeAnthropicError(w http.ResponseWriter, status int, code, msg string) {
 }
 
 func mapCCErrorToAnthropic(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrNoHealthyAccount) || errors.Is(err, poolErrNoHealthyAccount) {
+		writeAnthropicError(w, http.StatusServiceUnavailable, "no_account", err.Error())
+		return
+	}
 	var ae *cc.APIError
 	if errors.As(err, &ae) {
 		status := ae.HTTPStatus

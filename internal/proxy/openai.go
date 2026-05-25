@@ -18,11 +18,15 @@ import (
 )
 
 // OpenAIHandler serves POST /v1/chat/completions. It is wired in
-// main.go with a bearer-protected route.
+// main.go with a bearer-protected route. Runner is the shared
+// pool+retry executor; if nil, ServeHTTP falls back to the
+// placeholder pick so the handler stays usable in unit tests that do
+// not exercise the retry path.
 type OpenAIHandler struct {
 	Store  *store.Store
 	CC     *cc.Client
 	Logger *slog.Logger
+	Runner *Runner
 }
 
 // openaiRequest is what we actually look at from incoming JSON. Fields
@@ -170,36 +174,26 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Protocol:    "openai",
 	}
 
-	acc, err := pickAccount(h.Store)
-	if err != nil {
-		writeOpenAIError(w, http.StatusServiceUnavailable, "no_account", err.Error())
-		return
-	}
-
-	body := BuildCCBody(canon)
-	sid := SessionID(clientToken, canon.Model, MessagesPrefix(canon.Messages))
-
 	ignored := collectIgnoredOpenAIFields(&req)
 	if len(ignored) > 0 {
 		w.Header().Set("x-cmdgo-ignored", strings.Join(ignored, ","))
 	}
-	w.Header().Set("x-cmdgo-account-id", acc.ID)
 	w.Header().Set("x-cmdgo-protocol", "openai")
 	w.Header().Set("x-cmdgo-model", req.Model)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	resp, err := h.CC.Generate(ctx, cc.GenerateOpts{
-		APIKey:    acc.APIKey,
-		SessionID: sid,
-		Body:      body,
-	})
+	attempt, accID, err := openAttempt(ctx, h.Runner, h.Store, h.CC, h.Logger, canon)
 	if err != nil {
 		mapCCErrorToOpenAI(w, err)
 		return
 	}
-	defer resp.Body.Close()
+	defer attempt.Response.Body.Close()
+	w.Header().Set("x-cmdgo-account-id", accID)
+	if attempt.Retried {
+		w.Header().Set("x-cmdgo-retried", "true")
+	}
 
 	sse, err := NewSSEWriter(w)
 	if err != nil {
@@ -209,14 +203,20 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	id := newCompletionID()
 	created := time.Now().Unix()
-	if err := streamCCToOpenAI(h.Logger, cc.NewScanner(resp.Body), sse, id, req.Model, created); err != nil {
-		// Stream errored after we'd already started flushing. Log and
-		// stop — we cannot reset the status code at this point.
-		h.Logger.Warn("openai stream error", "err", err, "account", acc.ID)
+	stream := newPrefixedStream(attempt.FirstEvent, attempt.Scanner)
+	if err := streamCCToOpenAI(h.Logger, stream, sse, id, req.Model, created); err != nil {
+		h.Logger.Warn("openai stream error", "err", err, "account", accID)
+		if h.Runner != nil {
+			h.Runner.Pool.MarkError(accID)
+		}
+		return
+	}
+	if h.Runner != nil {
+		h.Runner.Pool.MarkSuccess(accID)
 	}
 }
 
-func streamCCToOpenAI(logger *slog.Logger, sc *cc.Scanner, sse *SSEWriter, id, model string, created int64) error {
+func streamCCToOpenAI(logger *slog.Logger, sc eventStream, sse *SSEWriter, id, model string, created int64) error {
 	sentRole := false
 	var toolIndex int
 
@@ -521,6 +521,10 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 }
 
 func mapCCErrorToOpenAI(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrNoHealthyAccount) || errors.Is(err, poolErrNoHealthyAccount) {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "no_account", err.Error())
+		return
+	}
 	var ae *cc.APIError
 	if errors.As(err, &ae) {
 		status := ae.HTTPStatus

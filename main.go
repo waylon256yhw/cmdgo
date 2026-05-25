@@ -17,6 +17,7 @@ import (
 
 	"github.com/waylon256yhw/cmdgo/internal/cc"
 	"github.com/waylon256yhw/cmdgo/internal/config"
+	"github.com/waylon256yhw/cmdgo/internal/pool"
 	"github.com/waylon256yhw/cmdgo/internal/proxy"
 	"github.com/waylon256yhw/cmdgo/internal/server"
 	"github.com/waylon256yhw/cmdgo/internal/store"
@@ -66,8 +67,10 @@ func run(args []string) error {
 		Listen:    cfg.Listen,
 		PublicURL: cfg.PublicURL,
 	}
-	openai := &proxy.OpenAIHandler{Store: st, CC: ccClient, Logger: logger}
-	anthropic := &proxy.AnthropicHandler{Store: st, CC: ccClient, Logger: logger}
+	accPool := pool.New(st)
+	runner := &proxy.Runner{Pool: accPool, CC: ccClient, Logger: logger}
+	openai := &proxy.OpenAIHandler{Store: st, CC: ccClient, Logger: logger, Runner: runner}
+	anthropic := &proxy.AnthropicHandler{Store: st, CC: ccClient, Logger: logger, Runner: runner}
 	models := &proxy.ModelsHandler{}
 
 	mux := newMux(st, oauth, openai, anthropic, models)
