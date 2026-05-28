@@ -1,0 +1,30 @@
+#!/bin/sh
+# Block commits that introduce ungofmt'd Go files. Mirrors what
+# .github/workflows/ci.yml runs, so failing here is a fast-feedback
+# version of the same check.
+#
+# One-time install per clone:
+#   git config core.hooksPath .githooks
+#
+# Bypass (please don't, fix the file):
+#   git commit --no-verify
+#
+# Note: checks the worktree, not the index. If you stage a clean
+# version then unstage-edit it to be dirty before committing this
+# hook will miss it — CI is the safety net for that path.
+
+set -e
+
+files=$(git diff --cached --name-only --diff-filter=ACM -- '*.go' 2>/dev/null)
+[ -z "$files" ] && exit 0
+
+# shellcheck disable=SC2086  # filename word-splitting is intentional
+unformatted=$(gofmt -l $files 2>/dev/null || true)
+[ -z "$unformatted" ] && exit 0
+
+echo "pre-commit: gofmt would reformat:" >&2
+echo "$unformatted" | sed 's/^/  /' >&2
+echo >&2
+# shellcheck disable=SC2086
+echo "Fix:  gofmt -w $unformatted" >&2
+exit 1

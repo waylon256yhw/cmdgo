@@ -64,7 +64,14 @@ go build -o cmdgo .
 ./cmdgo
 ```
 
-Requires Go 1.26+.
+Requires Go 1.26+. If you'll be sending PRs, run once:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+That wires the `pre-commit` hook in `.githooks/` so `gofmt`-dirty
+files are caught locally before CI rejects them.
 
 ## Configuration
 
