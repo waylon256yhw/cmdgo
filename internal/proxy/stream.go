@@ -61,12 +61,25 @@ type AccumulatedResponse struct {
 	FinishReceived bool // true iff CC emitted a finish event before EOF
 }
 
+// UpstreamStreamError wraps a CC `error` frame raw payload so callers
+// can decide retryability (via isStreamErrorRetryable) and re-classify
+// (via classifyStreamError). The non-streaming retry path keys off
+// this type — a generic wrapped error would lose the raw frame.
+type UpstreamStreamError struct {
+	Raw json.RawMessage
+}
+
+func (e *UpstreamStreamError) Error() string {
+	return fmt.Sprintf("upstream emitted error event mid-stream: %s", truncate(e.Raw, 200))
+}
+
 // AccumulateStream drains sc into an AccumulatedResponse. Returns
 // (acc, nil) on a clean stream (with or without a finish frame —
-// FinishReceived signals which). Returns an error for scanner
-// failures and for mid-stream upstream error frames; in those cases
-// the partial accumulator is still returned so callers can decide
-// whether to surface what was collected.
+// FinishReceived signals which). Returns *UpstreamStreamError for
+// upstream `error` frames, and a generic wrapped error for scanner
+// failures. In all error cases the partial accumulator is still
+// returned so callers can decide whether to surface what was
+// collected.
 func AccumulateStream(sc eventStream) (*AccumulatedResponse, error) {
 	acc := &AccumulatedResponse{}
 	// openMergeable is the type ("text"/"thinking") of the last
@@ -136,7 +149,7 @@ func AccumulateStream(sc eventStream) (*AccumulatedResponse, error) {
 				// indefinitely.
 				return acc, nil
 			case "error":
-				return acc, fmt.Errorf("upstream emitted error event mid-stream: %s", truncate(ev.Raw, 200))
+				return acc, &UpstreamStreamError{Raw: ev.Raw}
 			}
 		}
 		if errors.Is(err, io.EOF) {

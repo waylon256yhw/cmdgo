@@ -121,6 +121,17 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	rec := h.recorder()
 
+	// See openai.go's matching branch — non-streaming hasn't flushed
+	// anything to the client yet, so its retry budget covers the
+	// whole CC stream (Runner.ExecuteAccumulated). Streaming flushes
+	// the first frame and can only retry the open phase.
+	wantStream := req.Stream != nil && *req.Stream
+	if !wantStream {
+		h.serveAnthropicNonStream(ctx, w, canon, req.Model, started, rec)
+		_ = affinity
+		return
+	}
+
 	attempt, accID, err := openAttempt(ctx, h.Runner, h.Store, h.CC, h.Logger, canon)
 	if err != nil {
 		mapCCErrorToAnthropic(w, err)
@@ -149,12 +160,6 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stream := newPrefixedStream(attempt.FirstEvent, attempt.Scanner)
-	wantStream := req.Stream != nil && *req.Stream
-	if !wantStream {
-		h.serveAnthropicNonStream(w, stream, accID, req.Model, attempt.Retried, started, rec)
-		_ = affinity
-		return
-	}
 
 	sse, err := NewSSEWriter(w)
 	if err != nil {
@@ -195,30 +200,40 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveAnthropicNonStream drains the upstream stream into a complete
-// /v1/messages response. The Anthropic SDK defaults to stream=false.
+// /v1/messages response via Runner.ExecuteAccumulated, which applies
+// the full retry budget — the Anthropic SDK defaults to stream=false,
+// and a CC `error{retryable:true}` frame after a `start` is still
+// recoverable here because no bytes have been sent to the client.
 func (h *AnthropicHandler) serveAnthropicNonStream(
+	ctx context.Context,
 	w http.ResponseWriter,
-	stream eventStream,
-	accID, model string,
-	retried bool,
+	canon *Canonical,
+	model string,
 	started time.Time,
 	rec TrafficRecorder,
 ) {
-	acc, err := AccumulateStream(stream)
+	attempt, accID, err := openAccumulated(ctx, h.Runner, h.Store, h.CC, h.Logger, canon)
 	if err != nil {
-		h.Logger.Warn("anthropic non-stream accumulate error", "err", err, "account", accID)
-		writeAnthropicError(w, http.StatusBadGateway, "stream_error", err.Error())
+		mapCCErrorToAnthropic(w, err)
 		rec.RecordTraffic(store.TrafficEntry{
 			AccountID:  accID,
 			Protocol:   "anthropic",
 			Model:      model,
-			Status:     http.StatusBadGateway,
+			Status:     httpStatusFromErr(err, http.StatusBadGateway),
 			DurationMS: int(time.Since(started).Milliseconds()),
-			Retried:    retried,
-			ErrorCode:  "stream_error",
+			ErrorCode:  errorCodeFromErr(err),
 		})
 		return
 	}
+	w.Header().Set("x-cmdgo-account-id", accID)
+	if attempt.Retried {
+		w.Header().Set("x-cmdgo-retried", "true")
+	}
+	if h.Runner != nil {
+		h.Runner.Pool.MarkSuccess(accID)
+	}
+
+	acc := attempt.Accumulated
 	if !acc.FinishReceived && len(acc.Blocks) == 0 {
 		writeAnthropicError(w, http.StatusBadGateway, "empty_stream", "upstream stream produced no content")
 		rec.RecordTraffic(store.TrafficEntry{
@@ -227,7 +242,7 @@ func (h *AnthropicHandler) serveAnthropicNonStream(
 			Model:      model,
 			Status:     http.StatusBadGateway,
 			DurationMS: int(time.Since(started).Milliseconds()),
-			Retried:    retried,
+			Retried:    attempt.Retried,
 			ErrorCode:  "empty_stream",
 		})
 		return
@@ -250,7 +265,7 @@ func (h *AnthropicHandler) serveAnthropicNonStream(
 		OutputTokens:     acc.Summary.OutputTokens,
 		CostUSD:          computeCostUSD(model, acc.Summary),
 		DurationMS:       int(time.Since(started).Milliseconds()),
-		Retried:          retried,
+		Retried:          attempt.Retried,
 	})
 }
 

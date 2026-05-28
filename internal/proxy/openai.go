@@ -224,6 +224,18 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	rec := h.recorder()
 
+	// Branch before opening upstream: non-streaming runs through the
+	// whole CC stream before any bytes go to the client, so its retry
+	// budget covers the full drain (a CC `error{retryable:true}` frame
+	// after a `start` is still pre-flush from the SDK's perspective).
+	// Streaming flushes the first frame to the wire, so its retry
+	// budget can only cover the open phase.
+	wantStream := req.Stream != nil && *req.Stream
+	if !wantStream {
+		h.serveOpenAINonStream(ctx, w, canon, req.Model, started, rec)
+		return
+	}
+
 	attempt, accID, err := openAttempt(ctx, h.Runner, h.Store, h.CC, h.Logger, canon)
 	if err != nil {
 		mapCCErrorToOpenAI(w, err)
@@ -262,11 +274,6 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stream := newPrefixedStream(attempt.FirstEvent, attempt.Scanner)
-	wantStream := req.Stream != nil && *req.Stream
-	if !wantStream {
-		h.serveOpenAINonStream(w, stream, accID, req.Model, attempt.Retried, started, rec)
-		return
-	}
 
 	sse, err := NewSSEWriter(w)
 	if err != nil {
@@ -308,37 +315,42 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveOpenAINonStream drains the upstream stream into a complete
-// chat-completion JSON response. Used when the request lacks
-// stream=true (the OpenAI SDK's default for client.chat.completions
-// .create()).
+// chat-completion JSON response via Runner.ExecuteAccumulated, which
+// applies the full retry budget — non-streaming responses haven't
+// sent any bytes to the client yet, so a CC error{retryable:true}
+// frame after a `start` is still recoverable by hopping to a fresh
+// account / session id.
 func (h *OpenAIHandler) serveOpenAINonStream(
+	ctx context.Context,
 	w http.ResponseWriter,
-	stream eventStream,
-	accID, model string,
-	retried bool,
+	canon *Canonical,
+	model string,
 	started time.Time,
 	rec TrafficRecorder,
 ) {
-	acc, err := AccumulateStream(stream)
+	attempt, accID, err := openAccumulated(ctx, h.Runner, h.Store, h.CC, h.Logger, canon)
 	if err != nil {
-		h.Logger.Warn("openai non-stream accumulate error", "err", err, "account", accID)
-		writeOpenAIError(w, http.StatusBadGateway, "stream_error", err.Error())
+		mapCCErrorToOpenAI(w, err)
 		rec.RecordTraffic(store.TrafficEntry{
 			AccountID:  accID,
 			Protocol:   "openai",
 			Model:      model,
-			Status:     http.StatusBadGateway,
+			Status:     httpStatusFromErr(err, http.StatusBadGateway),
 			DurationMS: int(time.Since(started).Milliseconds()),
-			Retried:    retried,
-			ErrorCode:  "stream_error",
+			ErrorCode:  errorCodeFromErr(err),
 		})
 		return
 	}
+	w.Header().Set("x-cmdgo-account-id", accID)
+	if attempt.Retried {
+		w.Header().Set("x-cmdgo-retried", "true")
+	}
+	if h.Runner != nil {
+		h.Runner.Pool.MarkSuccess(accID)
+	}
+
+	acc := attempt.Accumulated
 	if !acc.FinishReceived && len(acc.Blocks) == 0 {
-		// Retry budget exhausted upstream of us; surface 502 rather
-		// than fake a "stop" completion. Pairs with retry.go's empty-
-		// stream retry — by the time we get here the pool has already
-		// tried.
 		writeOpenAIError(w, http.StatusBadGateway, "empty_stream", "upstream stream produced no content")
 		rec.RecordTraffic(store.TrafficEntry{
 			AccountID:  accID,
@@ -346,7 +358,7 @@ func (h *OpenAIHandler) serveOpenAINonStream(
 			Model:      model,
 			Status:     http.StatusBadGateway,
 			DurationMS: int(time.Since(started).Milliseconds()),
-			Retried:    retried,
+			Retried:    attempt.Retried,
 			ErrorCode:  "empty_stream",
 		})
 		return
@@ -369,7 +381,7 @@ func (h *OpenAIHandler) serveOpenAINonStream(
 		OutputTokens:     acc.Summary.OutputTokens,
 		CostUSD:          computeCostUSD(model, acc.Summary),
 		DurationMS:       int(time.Since(started).Milliseconds()),
-		Retried:          retried,
+		Retried:          attempt.Retried,
 	})
 }
 

@@ -234,6 +234,125 @@ func TestRunnerExhaustsBudgetAndReturnsLastErr(t *testing.T) {
 	}
 }
 
+// TestExecuteAccumulatedRetriesOnStreamErrorAfterStart pins the
+// bug fix: a CC stream that emits `start` then
+// `error{isRetryable:true}` is *not* a successful upstream attempt
+// from the non-streaming SDK's perspective. Because nothing has
+// been flushed to the client yet, the retry budget should kick in
+// and hop to a different account. The streaming path (Execute) only
+// peeks the first frame, which is why it needs its own non-stream
+// sibling.
+func TestExecuteAccumulatedRetriesOnStreamErrorAfterStart(t *testing.T) {
+	r, p, _, cleanup := twoAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		if n == 1 {
+			writeSSE(w,
+				`{"type":"start"}`,
+				`{"type":"error","error":{"type":"server_error","message":"upstream wobble","statusCode":503,"isRetryable":true}}`,
+			)
+			return
+		}
+		writeSSE(w,
+			`{"type":"start"}`,
+			`{"type":"text-delta","text":"hi"}`,
+			`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":3,"outputTokens":1,"totalTokens":4,"inputTokenDetails":{},"outputTokenDetails":{}}}`,
+		)
+	})
+	defer cleanup()
+
+	att, err := r.ExecuteAccumulated(context.Background(), makeCanon())
+	if err != nil {
+		t.Fatalf("expected recovery on second attempt, got err=%v", err)
+	}
+	if !att.Retried {
+		t.Error("Retried=false; expected retry after mid-stream retryable error")
+	}
+	if len(att.Accumulated.Blocks) != 1 || att.Accumulated.Blocks[0].Text != "hi" {
+		t.Errorf("blocks=%+v, want single text block \"hi\"", att.Accumulated.Blocks)
+	}
+	if !att.Accumulated.FinishReceived {
+		t.Error("FinishReceived=false on the recovery attempt")
+	}
+	// Transient stream error must not mark — both accounts stay healthy.
+	for _, id := range []string{"alpha", "beta"} {
+		if _, errs := p.Stats(id); errs != 0 {
+			t.Errorf("account %s: errs=%d, want 0 (server_error is classTransient)", id, errs)
+		}
+	}
+}
+
+func TestExecuteAccumulatedPropagatesNonRetryableStreamError(t *testing.T) {
+	r, _, _, cleanup := twoAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		writeSSE(w,
+			`{"type":"start"}`,
+			`{"type":"error","error":{"type":"invalid_request","message":"INVALID_REQUEST: bad shape","statusCode":400,"isRetryable":false}}`,
+		)
+	})
+	defer cleanup()
+
+	_, err := r.ExecuteAccumulated(context.Background(), makeCanon())
+	if err == nil {
+		t.Fatal("expected propagated error, got nil")
+	}
+	ae, ok := err.(*cc.APIError)
+	if !ok {
+		t.Fatalf("err type=%T, want *cc.APIError", err)
+	}
+	if ae.HTTPStatus != http.StatusBadRequest {
+		t.Errorf("status=%d, want 400", ae.HTTPStatus)
+	}
+}
+
+func TestExecuteAccumulatedEmptyStreamRetries(t *testing.T) {
+	r, _, _, cleanup := twoAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		if n == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeSSE(w,
+			`{"type":"text-delta","text":"ok"}`,
+			`{"type":"finish","finishReason":"stop","totalUsage":{}}`,
+		)
+	})
+	defer cleanup()
+
+	att, err := r.ExecuteAccumulated(context.Background(), makeCanon())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !att.Retried {
+		t.Error("Retried=false; expected retry after empty stream")
+	}
+	if len(att.Accumulated.Blocks) != 1 || att.Accumulated.Blocks[0].Text != "ok" {
+		t.Errorf("blocks=%+v", att.Accumulated.Blocks)
+	}
+}
+
+func TestExecuteAccumulatedHappyPath(t *testing.T) {
+	r, _, _, cleanup := twoAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		writeSSE(w,
+			`{"type":"start"}`,
+			`{"type":"text-delta","text":"pong"}`,
+			`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":2,"outputTokens":1,"totalTokens":3,"inputTokenDetails":{},"outputTokenDetails":{}}}`,
+		)
+	})
+	defer cleanup()
+
+	att, err := r.ExecuteAccumulated(context.Background(), makeCanon())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if att.Retried {
+		t.Error("Retried=true on happy path")
+	}
+	if !att.Accumulated.FinishReceived {
+		t.Error("FinishReceived=false on success")
+	}
+	if att.Accumulated.Summary.OutputTokens != 1 {
+		t.Errorf("OutputTokens=%d, want 1", att.Accumulated.Summary.OutputTokens)
+	}
+}
+
 func TestPreFlush429QuotaExceededRetriesAndMarks(t *testing.T) {
 	// Per plan §9, HTTP 429 is always retryable. Even when the
 	// message prefix puts the failure into classAccount (this apikey

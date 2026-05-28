@@ -93,6 +93,18 @@ type UpstreamAttempt struct {
 	Retried    bool
 }
 
+// AccumulatedAttempt is the result of a fully-drained non-streaming
+// upstream call. ExecuteAccumulated returns this; the caller
+// serialises Accumulated into the protocol-specific JSON response.
+//
+// Unlike UpstreamAttempt, the body is already consumed and closed —
+// non-streaming callers don't need streaming access to the upstream.
+type AccumulatedAttempt struct {
+	Accumulated *AccumulatedResponse
+	Account     *store.Account
+	Retried     bool
+}
+
 // Runner ties together a Pool and a cc.Client. Adapters acquire one
 // via NewRunner and call Execute with the canonical request.
 type Runner struct {
@@ -244,6 +256,140 @@ func (r *Runner) Execute(ctx context.Context, canon *Canonical) (*UpstreamAttemp
 			FirstEvent: first,
 			Account:    acc,
 			Retried:    attempt > 0,
+		}, nil
+	}
+
+	if !hadAttempt && lastErr == nil {
+		return nil, errors.New("proxy: no upstream attempt was made")
+	}
+	if lastErr == nil {
+		lastErr = errors.New("proxy: retry budget exhausted")
+	}
+	return nil, lastErr
+}
+
+// ExecuteAccumulated is the non-streaming sibling of Execute. Because
+// nothing is flushed to the client until the full response is built,
+// the retry budget covers the *entire* CC stream — including mid-
+// stream retryable errors. Compare to Execute, which can only retry
+// before the first frame is handed to a streaming adapter (and from
+// there to the wire). The pick / backoff / classify / mark logic is
+// otherwise identical.
+//
+// Returns AccumulatedAttempt on success; the body is already drained
+// and closed. On failure, the error is the same shape Execute would
+// return so the protocol adapters can reuse mapCCErrorToOpenAI /
+// mapCCErrorToAnthropic without branching.
+func (r *Runner) ExecuteAccumulated(ctx context.Context, canon *Canonical) (*AccumulatedAttempt, error) {
+	tried := make(map[string]bool)
+	var lastErr error
+	prefix := MessagesPrefix(canon.Messages)
+	hadAttempt := false
+
+	for attempt := 0; attempt < len(retryBackoffs); attempt++ {
+		if backoff := retryBackoffs[attempt]; backoff > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+
+		pickOpts := pool.PickOptions{
+			ClientToken:    canon.ClientToken,
+			Model:          canon.Model,
+			MessagesPrefix: prefix,
+			Exclude:        tried,
+		}
+		acc, err := r.Pool.Pick(pickOpts)
+		if errors.Is(err, pool.ErrNoHealthyAccount) && len(tried) > 0 {
+			tried = make(map[string]bool)
+			pickOpts.Exclude = tried
+			acc, err = r.Pool.Pick(pickOpts)
+		}
+		if err != nil {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, err
+		}
+		tried[acc.ID] = true
+		hadAttempt = true
+
+		sid := SessionID(canon.ClientToken+"#"+strconv.Itoa(attempt), canon.Model, prefix)
+		resp, err := r.CC.Generate(ctx, cc.GenerateOpts{
+			APIKey:    acc.APIKey,
+			SessionID: sid,
+			Body:      BuildCCBody(canon),
+		})
+		if err != nil {
+			class := classifyOpenError(err)
+			markError(r.Pool, acc.ID, class)
+			if class == classClient {
+				return nil, err
+			}
+			if !shouldRetryError(err) {
+				return nil, err
+			}
+			r.Logger.Warn("accumulated upstream open failed, will retry",
+				"attempt", attempt+1, "account", acc.ID, "class", class, "err", err)
+			lastErr = err
+			continue
+		}
+
+		// Drain the whole stream — non-streaming clients don't see
+		// bytes until we've serialised JSON, so the retry budget
+		// applies to anything that happens before this returns.
+		scanner := cc.NewScanner(resp.Body)
+		accum, accErr := AccumulateStream(scanner)
+		_ = resp.Body.Close()
+
+		if accErr != nil {
+			// CC `error` frame mid-stream — same retryability rules as
+			// Execute's first-frame error case, just at a later point
+			// in the stream.
+			var se *UpstreamStreamError
+			if errors.As(accErr, &se) {
+				class := classifyStreamError(se.Raw)
+				if isStreamErrorRetryable(se.Raw) {
+					markError(r.Pool, acc.ID, class)
+					r.Logger.Warn("accumulated stream error (retryable), will retry",
+						"attempt", attempt+1, "account", acc.ID, "class", class,
+						"raw", truncate(se.Raw, 200))
+					lastErr = se
+					continue
+				}
+				ae := streamErrorToAPIError(se.Raw)
+				markError(r.Pool, acc.ID, class)
+				return nil, ae
+			}
+			// Bare scanner / I/O error mid-stream. classifyOpenError's
+			// rules apply — client cancel propagates without retry;
+			// everything else is transient.
+			class := classifyOpenError(accErr)
+			markError(r.Pool, acc.ID, class)
+			if class == classClient {
+				return nil, accErr
+			}
+			r.Logger.Warn("accumulated upstream read failed, will retry",
+				"attempt", attempt+1, "account", acc.ID, "class", class, "err", accErr)
+			lastErr = accErr
+			continue
+		}
+
+		// Empty stream after a clean EOF — same handling as Execute.
+		if !accum.FinishReceived && len(accum.Blocks) == 0 {
+			markError(r.Pool, acc.ID, classTransient)
+			r.Logger.Warn("accumulated upstream returned empty stream, will retry",
+				"attempt", attempt+1, "account", acc.ID)
+			lastErr = errors.New("proxy: upstream returned empty stream")
+			continue
+		}
+
+		return &AccumulatedAttempt{
+			Accumulated: accum,
+			Account:     acc,
+			Retried:     attempt > 0,
 		}, nil
 	}
 
@@ -533,5 +679,48 @@ func openAttempt(
 		Response: resp,
 		Scanner:  scanner,
 		Account:  acc,
+	}, acc.ID, nil
+}
+
+// openAccumulated is the non-streaming analogue of openAttempt:
+// Runner.ExecuteAccumulated when a runner is wired, otherwise a
+// no-retry fallback that opens, drains, and closes the upstream so
+// tests without a pool keep working.
+func openAccumulated(
+	ctx context.Context,
+	runner *Runner,
+	st *store.Store,
+	client *cc.Client,
+	logger *slog.Logger,
+	canon *Canonical,
+) (*AccumulatedAttempt, string, error) {
+	if runner != nil {
+		att, err := runner.ExecuteAccumulated(ctx, canon)
+		if err != nil {
+			return nil, "", err
+		}
+		return att, att.Account.ID, nil
+	}
+	acc, err := pickAccount(st)
+	if err != nil {
+		return nil, "", err
+	}
+	sid := SessionID(canon.ClientToken, canon.Model, MessagesPrefix(canon.Messages))
+	resp, err := client.Generate(ctx, cc.GenerateOpts{
+		APIKey:    acc.APIKey,
+		SessionID: sid,
+		Body:      BuildCCBody(canon),
+	})
+	if err != nil {
+		return nil, acc.ID, err
+	}
+	accum, accErr := AccumulateStream(cc.NewScanner(resp.Body))
+	_ = resp.Body.Close()
+	if accErr != nil {
+		return nil, acc.ID, accErr
+	}
+	return &AccumulatedAttempt{
+		Accumulated: accum,
+		Account:     acc,
 	}, acc.ID, nil
 }
