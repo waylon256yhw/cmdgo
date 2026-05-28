@@ -28,7 +28,7 @@ Command Code's Go tier doesn't ship a native API endpoint — only the official 
 
 ## Scope
 
-Only the Go tier. The 12 open-source models on Go (DeepSeek V4 Pro/Flash, MiniMax M2.5/M2.7, Qwen 3.6 Plus / 3.6 Max-Preview / 3.7 Max, Kimi K2.5/K2.6, GLM-5/5.1, Step 3.5 Flash) are whitelisted; Anthropic / OpenAI / Gemini models are server-side plan-locked and return `MODEL_NOT_IN_PLAN`. If you have Pro/Max/Ultra, use the native API.
+Only the Go tier. The 14 open-source models on Go (DeepSeek V4 Pro/Flash, MiMo V2.5/V2.5 Pro, MiniMax M2.5/M2.7, Qwen 3.6 Plus / 3.6 Max-Preview / 3.7 Max, Kimi K2.5/K2.6, GLM-5/5.1, Step 3.5 Flash) are whitelisted; Anthropic / OpenAI / Gemini models are server-side plan-locked and return `MODEL_NOT_IN_PLAN`. If you have Pro/Max/Ultra, use the native API.
 
 ## Quick start
 

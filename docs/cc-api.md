@@ -534,13 +534,15 @@ POST <callback>
 
 Go 套餐通过反代调用 Anthropic / OpenAI / Gemini 模型 → HTTP 403 MODEL_NOT_IN_PLAN（服务端 plan-level 拦截）。
 
-### Go-eligible 模型清单（12 个）
+### Go-eligible 模型清单（14 个）
 
 | Model ID | In/Out/Cache /M | 备注 |
 |---|---|---|
 | `stepfun/Step-3.5-Flash` | $0.10 / $0.30 / $0.02 | 最便宜 |
 | `deepseek/deepseek-v4-pro` | $0.435 / $0.87 / $0.003625 | **75% off 永久**（4× 用量）|
 | `deepseek/deepseek-v4-flash` | $0.14 / $0.28 / $0.01 | 偶发 503 retryable |
+| `xiaomi/mimo-v2.5` | $0.14 / $0.28 / $0.0028 | **~98% off 永久**（小米合作）|
+| `xiaomi/mimo-v2.5-pro` | $0.435 / $0.87 / $0.0036 | **~99% off 永久**（小米合作）|
 | `MiniMaxAI/MiniMax-M2.5` | $0.27 / $0.95 / $0.03 | |
 | `MiniMaxAI/MiniMax-M2.7` | $0.30 / $1.20 / $0.06 | |
 | `Qwen/Qwen3.6-Plus` | $0.50 / $3.00 / $0.10 | |
@@ -558,6 +560,7 @@ Go 套餐通过反代调用 Anthropic / OpenAI / Gemini 模型 → HTTP 403 MODE
 | **Auto-cache** | DeepSeek V4 Pro/Flash | 全局 cache，无需 cache_control，跨 SID 命中 |
 | **Hint-cache** | Kimi K2.5/K2.6, GLM-5/5.1, Qwen 3.6 Plus/Max-Preview/3.7-Max, Step 3.5 Flash | 需要 `cache_control: {type:"ephemeral"}` 激活，激活后跨 SID 命中 |
 | **No-cache** | MiniMax M2.5/M2.7 | 上游不支持，cache_control 也无效 |
+| **Unverified** | MiMo V2.5/V2.5 Pro | 上游列出 cache 价格，但 Auto vs Hint 未实测 — cmdgo 默认注入 `cache_control: ephemeral`，命中率待跑 `/alpha/usage/summary` 确认 |
 
 ### CC 后端自动注入的 systemPrompt
 
