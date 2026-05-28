@@ -62,10 +62,19 @@ func (c FailureClass) String() string {
 }
 
 // markError is the single entry point for poisoning an account's
-// rolling stats. Commit 1 keeps the historic behaviour (always mark)
-// regardless of class — the gating lands in commit 2.
+// rolling stats. Only classAccount counts — protocol errors are
+// request-shape problems, transient errors are upstream-link wobble
+// (a future commit wires them into a separate Pool.MarkTransient
+// counter for dashboard observability without affecting Pick), and
+// client errors mean the user hung up before we even saw a response.
+//
+// Treating all three of those as "this account is unhealthy" caused
+// single-account deployments to evict their only key after a single
+// network blip; that's the exact regression we're fixing.
 func markError(p *pool.Pool, accountID string, class FailureClass) {
-	_ = class // gated in commit 2
+	if class != classAccount {
+		return
+	}
 	if p != nil {
 		p.MarkError(accountID)
 	}
@@ -146,12 +155,15 @@ func (r *Runner) Execute(ctx context.Context, canon *Canonical) (*UpstreamAttemp
 			Body:      BuildCCBody(canon),
 		})
 		if err != nil {
-			markError(r.Pool, acc.ID, classifyOpenError(err))
-			if !shouldRetryError(err) {
+			class := classifyOpenError(err)
+			markError(r.Pool, acc.ID, class)
+			if class != classTransient {
+				// classClient, classAccount, classProtocol: retry won't
+				// help (cancelled / bad key / bad request). Propagate.
 				return nil, err
 			}
 			r.Logger.Warn("upstream open failed, will retry",
-				"attempt", attempt+1, "account", acc.ID, "err", err)
+				"attempt", attempt+1, "account", acc.ID, "class", class, "err", err)
 			lastErr = err
 			continue
 		}
@@ -160,11 +172,13 @@ func (r *Runner) Execute(ctx context.Context, canon *Canonical) (*UpstreamAttemp
 		first, sErr := scanner.Next()
 		if sErr != nil && !errors.Is(sErr, io.EOF) {
 			_ = resp.Body.Close()
-			// First-read failures are bare I/O errors, not *cc.APIError;
-			// classifyOpenError routes them to classTransient.
-			markError(r.Pool, acc.ID, classifyOpenError(sErr))
+			class := classifyOpenError(sErr)
+			markError(r.Pool, acc.ID, class)
+			if class == classClient {
+				return nil, sErr
+			}
 			r.Logger.Warn("upstream first-read failed, will retry",
-				"attempt", attempt+1, "account", acc.ID, "err", sErr)
+				"attempt", attempt+1, "account", acc.ID, "class", class, "err", sErr)
 			lastErr = sErr
 			continue
 		}
@@ -178,7 +192,8 @@ func (r *Runner) Execute(ctx context.Context, canon *Canonical) (*UpstreamAttemp
 				_ = resp.Body.Close()
 				markError(r.Pool, acc.ID, class)
 				r.Logger.Warn("upstream stream error (retryable), will retry",
-					"attempt", attempt+1, "account", acc.ID, "raw", truncate(first.Raw, 200))
+					"attempt", attempt+1, "account", acc.ID, "class", class,
+					"raw", truncate(first.Raw, 200))
 				lastErr = fmt.Errorf("upstream stream error: %s", truncate(first.Raw, 200))
 				continue
 			}
@@ -207,26 +222,6 @@ func (r *Runner) Execute(ctx context.Context, canon *Canonical) (*UpstreamAttemp
 		lastErr = errors.New("proxy: retry budget exhausted")
 	}
 	return nil, lastErr
-}
-
-func shouldRetryError(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	var ae *cc.APIError
-	if errors.As(err, &ae) {
-		// 429 → retry. 5xx → retry. Everything else → no.
-		if ae.HTTPStatus == http.StatusTooManyRequests {
-			return true
-		}
-		if ae.HTTPStatus >= 500 && ae.HTTPStatus < 600 {
-			return true
-		}
-		return false
-	}
-	// Bare errors from net/http (dial / read header / connection reset
-	// before reply) are typically transient.
-	return true
 }
 
 // accountMessagePrefixes are the CC-side message prefixes that mean

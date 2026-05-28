@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -335,6 +336,118 @@ func TestClassifyStreamError(t *testing.T) {
 				t.Errorf("classifyStreamError(%s) = %s, want %s", tc.raw, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestPreFlushClientCancelDoesNotMarkError(t *testing.T) {
+	hold := make(chan struct{})
+	r, p, _, cleanup := twoAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		// Hang until the test releases us (or the client cancels the ctx,
+		// which net/http surfaces by closing the body).
+		<-hold
+	})
+	defer cleanup()
+	defer close(hold)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel almost immediately so the upstream open returns a ctx error
+	// from net/http's transport layer.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err := r.Execute(ctx, makeCanon())
+	if err == nil {
+		t.Fatal("expected ctx error, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected ctx canceled, got %v", err)
+	}
+	// Neither account should have been poisoned — the client hung up,
+	// the apikeys are still healthy.
+	for _, id := range []string{"alpha", "beta"} {
+		reqs, errs := p.Stats(id)
+		if errs != 0 {
+			t.Errorf("account %s: errs=%d, want 0 (client cancel must not MarkError); reqs=%d", id, errs, reqs)
+		}
+	}
+}
+
+func TestPreFlushModelNotInPlanDoesNotMarkError(t *testing.T) {
+	r, p, _, cleanup := twoAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"success":false,"error":{"code":"FORBIDDEN","status":403,"message":"MODEL_NOT_IN_PLAN: Claude Haiku 4.5 is Pro+"}}`)
+	})
+	defer cleanup()
+
+	_, err := r.Execute(context.Background(), makeCanon())
+	if err == nil {
+		t.Fatal("expected protocol error, got nil")
+	}
+	if _, ok := err.(*cc.APIError); !ok {
+		t.Fatalf("expected *cc.APIError, got %T %v", err, err)
+	}
+	for _, id := range []string{"alpha", "beta"} {
+		_, errs := p.Stats(id)
+		if errs != 0 {
+			t.Errorf("account %s: errs=%d, want 0 (MODEL_NOT_IN_PLAN is protocol, not account)", id, errs)
+		}
+	}
+}
+
+func TestPreFlushInvalidAPIKeyMarksError(t *testing.T) {
+	var hitID string
+	r, p, _, cleanup := twoAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		// Both accounts will return 401 — we don't care which one Pick
+		// lands on, just that exactly one gets marked.
+		hitID = req.Header.Get("Authorization")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"success":false,"error":{"code":"UNAUTHORIZED","status":401,"message":"INVALID_API_KEY: token revoked"}}`)
+	})
+	defer cleanup()
+	_ = hitID
+
+	_, err := r.Execute(context.Background(), makeCanon())
+	if err == nil {
+		t.Fatal("expected 401 error, got nil")
+	}
+	// Exactly one account should have been marked. (The 401 is non-
+	// retryable, so retry budget isn't exercised.)
+	total := 0
+	for _, id := range []string{"alpha", "beta"} {
+		_, errs := p.Stats(id)
+		total += errs
+	}
+	if total != 1 {
+		t.Errorf("expected exactly 1 MarkError across both accounts, got %d", total)
+	}
+}
+
+func TestPreFlush502DoesNotMarkErrorButRetries(t *testing.T) {
+	r, p, _, cleanup := twoAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		if n == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"success":false,"error":{"code":"BAD_GATEWAY","status":502,"message":"upstream"}}`)
+			return
+		}
+		writeSSE(w, `{"type":"start"}`, `{"type":"finish","finishReason":"stop","totalUsage":{}}`)
+	})
+	defer cleanup()
+
+	att, err := r.Execute(context.Background(), makeCanon())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer att.Response.Body.Close()
+	if !att.Retried {
+		t.Error("Retried=false; expected retry after transient 502")
+	}
+	for _, id := range []string{"alpha", "beta"} {
+		_, errs := p.Stats(id)
+		if errs != 0 {
+			t.Errorf("account %s: errs=%d, want 0 (transient 502 must not MarkError)", id, errs)
+		}
 	}
 }
 
