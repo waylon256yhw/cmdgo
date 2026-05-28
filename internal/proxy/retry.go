@@ -26,14 +26,14 @@ var retryBackoffs = []time.Duration{0, 250 * time.Millisecond, 750 * time.Millis
 // follow-up — only classAccount actually poisons rolling stats.
 //
 //   - classAccount   — the apikey itself is broken (401, INVALID_API_KEY,
-//                      INSUFFICIENT_CREDITS, ACCOUNT_SUSPENDED). MarkError.
+//     INSUFFICIENT_CREDITS, ACCOUNT_SUSPENDED). MarkError.
 //   - classProtocol  — request is malformed or model not on plan
-//                      (MODEL_NOT_IN_PLAN, INVALID_REQUEST, generic 4xx).
-//                      The account is innocent; propagate to caller.
+//     (MODEL_NOT_IN_PLAN, INVALID_REQUEST, generic 4xx).
+//     The account is innocent; propagate to caller.
 //   - classTransient — upstream link wobble (5xx, network, retryable
-//                      stream error). The account is innocent; retry.
+//     stream error). The account is innocent; retry.
 //   - classClient    — client cancelled or its connection died. Nothing
-//                      to retry, nothing to mark.
+//     to retry, nothing to mark.
 //
 // Commit 1 wires the enum and the markError wrapper without changing
 // behaviour (the wrapper currently always calls MarkError). Commit 2

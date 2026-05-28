@@ -131,9 +131,9 @@ type openaiCompletion struct {
 }
 
 type openaiChoiceFull struct {
-	Index        int             `json:"index"`
+	Index        int              `json:"index"`
 	Message      openaiMessageOut `json:"message"`
-	FinishReason *string         `json:"finish_reason"`
+	FinishReason *string          `json:"finish_reason"`
 }
 
 type openaiMessageOut struct {
@@ -144,8 +144,8 @@ type openaiMessageOut struct {
 }
 
 type openaiToolCallOut struct {
-	ID       string                   `json:"id"`
-	Type     string                   `json:"type"`
+	ID       string                    `json:"id"`
+	Type     string                    `json:"type"`
 	Function openaiToolCallOutFunction `json:"function"`
 }
 

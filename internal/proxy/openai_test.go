@@ -424,7 +424,7 @@ func TestExtractClientTokenFallbacks(t *testing.T) {
 	const want = "pcc_aff1n1ty_test_token"
 
 	cases := []struct {
-		name string
+		name  string
 		setup func(r *http.Request)
 	}{
 		{"authorization_bearer", func(r *http.Request) {
