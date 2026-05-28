@@ -207,13 +207,56 @@ func TestClassifyOpenError(t *testing.T) {
 		err  error
 		want FailureClass
 	}{
+		// Client-side
 		{"context_canceled", context.Canceled, classClient},
 		{"context_deadline", context.DeadlineExceeded, classClient},
-		{"http_401", &cc.APIError{HTTPStatus: 401, Body: cc.APIErrorBody{Code: "UNAUTHORIZED"}}, classAccount},
-		{"http_403", &cc.APIError{HTTPStatus: 403, Body: cc.APIErrorBody{Code: "FORBIDDEN"}}, classAccount},
+
+		// Account: message prefix beats status code
+		{
+			"402_insufficient_credits",
+			&cc.APIError{HTTPStatus: 402, Body: cc.APIErrorBody{Code: "FORBIDDEN", Message: "INSUFFICIENT_CREDITS: out of credit"}},
+			classAccount,
+		},
+		{
+			"401_invalid_api_key",
+			&cc.APIError{HTTPStatus: 401, Body: cc.APIErrorBody{Code: "UNAUTHORIZED", Message: "INVALID_API_KEY: bad token"}},
+			classAccount,
+		},
+		{
+			"403_account_suspended",
+			&cc.APIError{HTTPStatus: 403, Body: cc.APIErrorBody{Code: "FORBIDDEN", Message: "ACCOUNT_SUSPENDED: tos violation"}},
+			classAccount,
+		},
+		// Account: code-only without prefix still wins
+		{
+			"401_no_message_unauthorized_code",
+			&cc.APIError{HTTPStatus: 401, Body: cc.APIErrorBody{Code: "UNAUTHORIZED"}},
+			classAccount,
+		},
+
+		// Protocol: MODEL_NOT_IN_PLAN under FORBIDDEN must NOT be account
+		{
+			"403_model_not_in_plan",
+			&cc.APIError{HTTPStatus: 403, Body: cc.APIErrorBody{Code: "FORBIDDEN", Message: "MODEL_NOT_IN_PLAN: Claude Haiku 4.5 is Pro+"}},
+			classProtocol,
+		},
+		{
+			"400_invalid_request",
+			&cc.APIError{HTTPStatus: 400, Body: cc.APIErrorBody{Code: "BAD_REQUEST", Message: "INVALID_REQUEST: missing field"}},
+			classProtocol,
+		},
+		// Protocol: bare 403 FORBIDDEN with no prefix defaults to protocol
+		// (single-account safety — don't kill the only key on a stray 403).
+		{
+			"403_bare_forbidden_no_prefix",
+			&cc.APIError{HTTPStatus: 403, Body: cc.APIErrorBody{Code: "FORBIDDEN"}},
+			classProtocol,
+		},
+
+		// Transient
 		{"http_429", &cc.APIError{HTTPStatus: 429}, classTransient},
 		{"http_502", &cc.APIError{HTTPStatus: 502}, classTransient},
-		{"network_bare", io.ErrUnexpectedEOF, classTransient},
+		{"network_bare_unexpected_eof", io.ErrUnexpectedEOF, classTransient},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -230,20 +273,60 @@ func TestClassifyStreamError(t *testing.T) {
 		raw  string
 		want FailureClass
 	}{
+		// Message-prefix priority
 		{
-			"retryable_true",
+			"model_not_in_plan_under_forbidden_type",
+			`{"type":"error","error":{"type":"forbidden","message":"MODEL_NOT_IN_PLAN: ...","statusCode":403,"isRetryable":false}}`,
+			classProtocol,
+		},
+		{
+			"insufficient_credits_isretryable_false",
+			`{"type":"error","error":{"type":"server_error","message":"INSUFFICIENT_CREDITS: out","statusCode":402,"isRetryable":false}}`,
+			classAccount,
+		},
+		{
+			"invalid_request_prefix",
+			`{"type":"error","error":{"type":"invalid_request","message":"INVALID_REQUEST: bad schema","statusCode":400,"isRetryable":false}}`,
+			classProtocol,
+		},
+
+		// Code priority when no message prefix
+		{
+			"unauthorized_code_no_prefix",
+			`{"type":"error","error":{"code":"UNAUTHORIZED","statusCode":401,"isRetryable":false}}`,
+			classAccount,
+		},
+
+		// Inner type fallback when no prefix and no code
+		{
+			"inner_type_invalid_request",
+			`{"type":"error","error":{"type":"invalid_request","statusCode":400,"isRetryable":false}}`,
+			classProtocol,
+		},
+
+		// isRetryable + status fallback
+		{
+			"retryable_true_server_error",
 			`{"type":"error","error":{"type":"server_error","statusCode":503,"isRetryable":true}}`,
 			classTransient,
 		},
 		{
-			"retryable_false",
-			`{"type":"error","error":{"type":"invalid_request","statusCode":400,"isRetryable":false}}`,
-			classAccount,
-		},
-		{
-			"retryable_unset_5xx_defaults_retry",
+			"retryable_unset_5xx_defaults_transient",
 			`{"type":"error","error":{"type":"server_error","statusCode":503}}`,
 			classTransient,
+		},
+		{
+			"retryable_unset_no_status_defaults_transient",
+			`{"type":"error","error":{"message":"network blip"}}`,
+			classTransient,
+		},
+
+		// Malformed payload → conservative classAccount (matches the
+		// historic always-MarkError behaviour for unparseable errors).
+		{
+			"malformed_json",
+			`not even json`,
+			classAccount,
 		},
 	}
 	for _, tc := range cases {

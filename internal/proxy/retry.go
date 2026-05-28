@@ -229,16 +229,43 @@ func shouldRetryError(err error) bool {
 	return true
 }
 
+// accountMessagePrefixes are the CC-side message prefixes that mean
+// "this apikey itself is broken". These dominate over HTTP status —
+// CC sometimes returns 402/403 for INSUFFICIENT_CREDITS.
+var accountMessagePrefixes = []string{
+	"INVALID_API_KEY",
+	"INSUFFICIENT_CREDITS",
+	"QUOTA_EXCEEDED",
+	"ACCOUNT_SUSPENDED",
+}
+
+// protocolMessagePrefixes are messages that describe a request-shape
+// or plan-tier problem — the account is innocent. Notably
+// MODEL_NOT_IN_PLAN arrives under HTTP 403 / code FORBIDDEN, which
+// without this list would look identical to a real auth failure.
+var protocolMessagePrefixes = []string{
+	"MODEL_NOT_IN_PLAN",
+	"INVALID_MODEL",
+	"INVALID_REQUEST",
+}
+
 // classifyOpenError maps an error from the upstream open (HTTP dial,
-// header read, /alpha/generate non-2xx) into a FailureClass. Commit 1
-// uses a coarse HTTP-status mapping that mirrors the historic "always
-// MarkError on 4xx" behaviour; commit 1.5 reworks this to prioritise
-// CC's message-prefix conventions (MODEL_NOT_IN_PLAN, etc.) so that
-// protocol-level errors stop poisoning account stats.
+// header read, /alpha/generate non-2xx) into a FailureClass. Decision
+// order, per docs/cc-api.md §4:
+//
+//  1. context errors → classClient (caller's fault, not the apikey's).
+//  2. *cc.APIError with a known account/protocol message prefix wins
+//     outright (CC packs the real reason into the message head; the
+//     code is too coarse — FORBIDDEN covers both MODEL_NOT_IN_PLAN and
+//     real bans).
+//  3. *cc.APIError code: UNAUTHORIZED / INVALID_API_KEY → classAccount;
+//     FORBIDDEN with no prefix match defaults to classProtocol so a
+//     single 403 doesn't poison the account.
+//  4. HTTP status fallback: 401 = classAccount, 429/5xx = classTransient,
+//     other 4xx = classProtocol.
+//  5. Bare error (dial timeout, EOF, reset) = classTransient.
 func classifyOpenError(err error) FailureClass {
 	if err == nil {
-		// Defensive: callers should not invoke this on success, but
-		// returning classAccount matches the old behaviour of marking.
 		return classAccount
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -246,34 +273,98 @@ func classifyOpenError(err error) FailureClass {
 	}
 	var ae *cc.APIError
 	if errors.As(err, &ae) {
+		if class, ok := classifyByMessage(ae.Body.Message); ok {
+			return class
+		}
+		switch strings.ToUpper(ae.Body.Code) {
+		case "UNAUTHORIZED", "INVALID_API_KEY":
+			return classAccount
+		case "FORBIDDEN":
+			// Already passed the message-prefix gate above. Without a
+			// prefix CC's 403 is ambiguous; default to protocol so a
+			// stray 403 doesn't kill the only healthy account.
+			return classProtocol
+		}
 		switch {
+		case ae.HTTPStatus == http.StatusUnauthorized:
+			return classAccount
 		case ae.HTTPStatus == http.StatusTooManyRequests:
 			return classTransient
 		case ae.HTTPStatus >= 500 && ae.HTTPStatus < 600:
 			return classTransient
-		case ae.HTTPStatus == http.StatusUnauthorized:
-			return classAccount
 		case ae.HTTPStatus >= 400 && ae.HTTPStatus < 500:
-			// Coarse: every other 4xx looks "account-ish" today.
-			// Commit 1.5 splits MODEL_NOT_IN_PLAN, INVALID_REQUEST out.
-			return classAccount
+			return classProtocol
 		}
 	}
-	// Bare network errors (dial / reset / EOF before headers) are
-	// transient by nature.
 	return classTransient
 }
 
 // classifyStreamError maps a CC-emitted `error` SSE frame to a
-// FailureClass. Commit 1 keys off only the isRetryable flag (mirroring
-// the historic "always MarkError on stream errors" behaviour); commit
-// 1.5 inspects the inner error.type / message prefix to peel protocol
-// errors away from account errors.
+// FailureClass. Same priority as classifyOpenError: message prefix →
+// inner type/code → isRetryable + statusCode fallback.
 func classifyStreamError(raw json.RawMessage) FailureClass {
-	if isStreamErrorRetryable(raw) {
+	var pl struct {
+		Error struct {
+			Type        string `json:"type"`
+			Message     string `json:"message"`
+			Code        string `json:"code"`
+			StatusCode  int    `json:"statusCode"`
+			IsRetryable *bool  `json:"isRetryable"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &pl); err != nil {
+		// Malformed payload — historic behaviour was "treat as account
+		// error". Keep that, since we can't reason about it.
+		return classAccount
+	}
+	if class, ok := classifyByMessage(pl.Error.Message); ok {
+		return class
+	}
+	switch strings.ToUpper(pl.Error.Code) {
+	case "UNAUTHORIZED", "INVALID_API_KEY":
+		return classAccount
+	case "FORBIDDEN":
+		return classProtocol
+	}
+	switch strings.ToLower(pl.Error.Type) {
+	case "invalid_request", "invalid_request_error":
+		return classProtocol
+	case "unauthorized", "authentication_error":
+		return classAccount
+	}
+	if pl.Error.IsRetryable != nil && *pl.Error.IsRetryable {
 		return classTransient
 	}
-	return classAccount
+	switch {
+	case pl.Error.StatusCode >= 500 && pl.Error.StatusCode < 600:
+		return classTransient
+	case pl.Error.StatusCode == http.StatusUnauthorized:
+		return classAccount
+	case pl.Error.StatusCode >= 400 && pl.Error.StatusCode < 500:
+		return classProtocol
+	}
+	return classTransient
+}
+
+// classifyByMessage inspects a CC error message for the well-known
+// SCREAMING_SNAKE prefixes. Returns (_, false) when no prefix matches.
+func classifyByMessage(msg string) (FailureClass, bool) {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return 0, false
+	}
+	upper := strings.ToUpper(msg)
+	for _, p := range accountMessagePrefixes {
+		if strings.HasPrefix(upper, p) {
+			return classAccount, true
+		}
+	}
+	for _, p := range protocolMessagePrefixes {
+		if strings.HasPrefix(upper, p) {
+			return classProtocol, true
+		}
+	}
+	return 0, false
 }
 
 func isStreamErrorRetryable(raw json.RawMessage) bool {
