@@ -328,6 +328,71 @@ func TestExecuteAccumulatedEmptyStreamRetries(t *testing.T) {
 	}
 }
 
+// TestExecuteAccumulatedTruncatedStreamRetries covers the partial
+// EOF case: attempt 1 emits some text-delta frames but EOFs before
+// the terminal `finish` event. Non-streaming has not flushed
+// anything, so returning a synthetic "length" completion would lie
+// about stop_reason and usage. The retry budget must kick in.
+func TestExecuteAccumulatedTruncatedStreamRetries(t *testing.T) {
+	r, p, _, cleanup := twoAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		if n == 1 {
+			// Partial content then EOF — no finish event.
+			writeSSE(w,
+				`{"type":"start"}`,
+				`{"type":"text-delta","text":"par"}`,
+				`{"type":"text-delta","text":"tial"}`,
+			)
+			return
+		}
+		writeSSE(w,
+			`{"type":"start"}`,
+			`{"type":"text-delta","text":"complete"}`,
+			`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":4,"outputTokens":1,"totalTokens":5,"inputTokenDetails":{},"outputTokenDetails":{}}}`,
+		)
+	})
+	defer cleanup()
+
+	att, err := r.ExecuteAccumulated(context.Background(), makeCanon())
+	if err != nil {
+		t.Fatalf("expected recovery on second attempt, got err=%v", err)
+	}
+	if !att.Retried {
+		t.Error("Retried=false; truncated streams must trigger the retry budget")
+	}
+	if !att.Accumulated.FinishReceived {
+		t.Error("FinishReceived=false on the recovery attempt")
+	}
+	if len(att.Accumulated.Blocks) != 1 || att.Accumulated.Blocks[0].Text != "complete" {
+		t.Errorf("blocks=%+v, want recovery content, NOT the truncated \"partial\" from attempt 1", att.Accumulated.Blocks)
+	}
+	for _, id := range []string{"alpha", "beta"} {
+		if _, errs := p.Stats(id); errs != 0 {
+			t.Errorf("account %s: errs=%d, want 0 (truncation is transient, not account fault)", id, errs)
+		}
+	}
+}
+
+func TestExecuteAccumulatedAllAttemptsTruncatedFailsLoudly(t *testing.T) {
+	// Single account, every attempt truncates after a few deltas.
+	// Without an explicit error, the handler would have served HTTP
+	// 200 with finish_reason="length" and incomplete usage — a lie.
+	r, _, _, cleanup := oneAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		writeSSE(w,
+			`{"type":"start"}`,
+			`{"type":"text-delta","text":"x"}`,
+		)
+	})
+	defer cleanup()
+
+	_, err := r.ExecuteAccumulated(context.Background(), makeCanon())
+	if err == nil {
+		t.Fatal("expected explicit truncation error after exhausting budget")
+	}
+	if !strings.Contains(err.Error(), "truncated") {
+		t.Errorf("err=%q, want to mention truncation", err)
+	}
+}
+
 func TestExecuteAccumulatedHappyPath(t *testing.T) {
 	r, _, _, cleanup := twoAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
 		writeSSE(w,

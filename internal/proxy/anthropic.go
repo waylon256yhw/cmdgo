@@ -234,8 +234,8 @@ func (h *AnthropicHandler) serveAnthropicNonStream(
 	}
 
 	acc := attempt.Accumulated
-	if !acc.FinishReceived && len(acc.Blocks) == 0 {
-		writeAnthropicError(w, http.StatusBadGateway, "empty_stream", "upstream stream produced no content")
+	if !acc.FinishReceived {
+		writeAnthropicError(w, http.StatusBadGateway, "upstream_truncated", "upstream stream ended before finish event")
 		rec.RecordTraffic(store.TrafficEntry{
 			AccountID:  accID,
 			Protocol:   "anthropic",
@@ -243,7 +243,7 @@ func (h *AnthropicHandler) serveAnthropicNonStream(
 			Status:     http.StatusBadGateway,
 			DurationMS: int(time.Since(started).Milliseconds()),
 			Retried:    attempt.Retried,
-			ErrorCode:  "empty_stream",
+			ErrorCode:  "upstream_truncated",
 		})
 		return
 	}
@@ -301,10 +301,11 @@ func buildAnthropicResponse(acc *AccumulatedResponse, id, model string) map[stri
 			})
 		}
 	}
+	// Callers must guard on acc.FinishReceived before reaching here —
+	// emitting a message for a truncated stream would lie about
+	// stop_reason and usage. The handler returns 502 with
+	// upstream_truncated in that case.
 	stopReason := anthropicStopReason(acc.Summary.FinishReason)
-	if !acc.FinishReceived {
-		stopReason = "max_tokens"
-	}
 	return map[string]any{
 		"id":            id,
 		"type":          "message",

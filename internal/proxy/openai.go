@@ -350,8 +350,12 @@ func (h *OpenAIHandler) serveOpenAINonStream(
 	}
 
 	acc := attempt.Accumulated
-	if !acc.FinishReceived && len(acc.Blocks) == 0 {
-		writeOpenAIError(w, http.StatusBadGateway, "empty_stream", "upstream stream produced no content")
+	if !acc.FinishReceived {
+		// ExecuteAccumulated normally retries truncated streams; this
+		// branch is the defence-in-depth for the no-runner fallback
+		// in openAccumulated (used by tests). Better to surface 502
+		// than to lie about finish_reason.
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_truncated", "upstream stream ended before finish event")
 		rec.RecordTraffic(store.TrafficEntry{
 			AccountID:  accID,
 			Protocol:   "openai",
@@ -359,7 +363,7 @@ func (h *OpenAIHandler) serveOpenAINonStream(
 			Status:     http.StatusBadGateway,
 			DurationMS: int(time.Since(started).Milliseconds()),
 			Retried:    attempt.Retried,
-			ErrorCode:  "empty_stream",
+			ErrorCode:  "upstream_truncated",
 		})
 		return
 	}
@@ -682,12 +686,11 @@ func buildOpenAICompletion(acc *AccumulatedResponse, id, model string, created i
 		ReasoningContent: strings.Join(reasoningParts, ""),
 		ToolCalls:        toolCalls,
 	}
+	// Callers must guard on acc.FinishReceived before reaching here —
+	// emitting a chat-completion for a truncated stream would lie
+	// about finish_reason and usage. The handler returns 502 with
+	// upstream_truncated in that case.
 	finish := normalizeFinishReason(acc.Summary.FinishReason)
-	if !acc.FinishReceived {
-		// Stream truncated without a finish frame; surface that as
-		// "length" so the SDK doesn't claim a clean stop.
-		finish = "length"
-	}
 	usage := openaiUsageFromSummary(acc.Summary)
 	return &openaiCompletion{
 		ID:      id,

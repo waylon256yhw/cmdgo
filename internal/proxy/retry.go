@@ -377,12 +377,21 @@ func (r *Runner) ExecuteAccumulated(ctx context.Context, canon *Canonical) (*Acc
 			continue
 		}
 
-		// Empty stream after a clean EOF — same handling as Execute.
-		if !accum.FinishReceived && len(accum.Blocks) == 0 {
+		// EOF before the documented terminal `finish` event — empty
+		// or truncated. For non-streaming this is always recoverable
+		// because no bytes have been sent to the client, so we don't
+		// have to decide whether the partial text we already
+		// collected is "good enough". Retry as classTransient
+		// (mirrors Execute's empty-stream handling). If the budget
+		// is spent on truncations, the explicit error below
+		// translates to a 502 with an empty_stream / truncated code
+		// in the handler — much better than a 200 with a synthetic
+		// finish_reason=length and zero usage.
+		if !accum.FinishReceived {
 			markError(r.Pool, acc.ID, classTransient)
-			r.Logger.Warn("accumulated upstream returned empty stream, will retry",
-				"attempt", attempt+1, "account", acc.ID)
-			lastErr = errors.New("proxy: upstream returned empty stream")
+			r.Logger.Warn("accumulated upstream truncated before finish, will retry",
+				"attempt", attempt+1, "account", acc.ID, "blocks", len(accum.Blocks))
+			lastErr = errors.New("proxy: upstream stream truncated before finish")
 			continue
 		}
 
