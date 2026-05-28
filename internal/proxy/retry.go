@@ -192,6 +192,20 @@ func (r *Runner) Execute(ctx context.Context, canon *Canonical) (*UpstreamAttemp
 			continue
 		}
 
+		// Empty stream: CC accepted the request and closed without
+		// emitting a single event. Most often that means an upstream
+		// pod died mid-response and CC gave up. Treat as classTransient
+		// and retry — propagating an empty 200 to the client would
+		// surface as a stuck/blank reply in the SDK.
+		if first == nil && errors.Is(sErr, io.EOF) {
+			_ = resp.Body.Close()
+			markError(r.Pool, acc.ID, classTransient)
+			r.Logger.Warn("upstream returned empty stream, will retry",
+				"attempt", attempt+1, "account", acc.ID)
+			lastErr = errors.New("proxy: upstream returned empty stream")
+			continue
+		}
+
 		// CC sometimes sends an `error` event as the first SSE frame
 		// instead of a non-2xx HTTP status. Respect its isRetryable
 		// flag.

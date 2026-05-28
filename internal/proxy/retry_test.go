@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -452,6 +453,60 @@ func TestPreFlushInvalidAPIKeyMarksError(t *testing.T) {
 	}
 	if total != 1 {
 		t.Errorf("expected exactly 1 MarkError across both accounts, got %d", total)
+	}
+}
+
+func TestEmptyFirstStreamRetries(t *testing.T) {
+	r, _, _, cleanup := twoAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		if n == 1 {
+			// Empty 200 SSE — headers + immediate close, no frames.
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeSSE(w, `{"type":"start"}`, `{"type":"finish","finishReason":"stop","totalUsage":{}}`)
+	})
+	defer cleanup()
+
+	att, err := r.Execute(context.Background(), makeCanon())
+	if err != nil {
+		t.Fatalf("expected recovery via retry, got %v", err)
+	}
+	defer att.Response.Body.Close()
+	if !att.Retried {
+		t.Error("Retried=false; expected retry after empty stream")
+	}
+	if att.FirstEvent == nil || att.FirstEvent.Type != "start" {
+		t.Errorf("FirstEvent=%+v, want start event from the recovery attempt", att.FirstEvent)
+	}
+}
+
+func TestEmptyStreamAllAttemptsFailsLoudly(t *testing.T) {
+	r, _, _, cleanup := oneAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+	})
+	defer cleanup()
+
+	_, err := r.Execute(context.Background(), makeCanon())
+	if err == nil {
+		t.Fatal("expected error after exhausting retry budget on empty streams")
+	}
+	if !strings.Contains(err.Error(), "empty stream") {
+		t.Errorf("err=%q, want an empty-stream sentinel (not a stale 200)", err)
+	}
+}
+
+func TestEmptyStreamDoesNotMarkError(t *testing.T) {
+	r, p, _, cleanup := oneAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+	})
+	defer cleanup()
+
+	_, _ = r.Execute(context.Background(), makeCanon())
+	if _, errs := p.Stats("solo"); errs != 0 {
+		t.Errorf("solo account: errs=%d, want 0 (empty stream is transient upstream wobble, not account fault)", errs)
 	}
 }
 
