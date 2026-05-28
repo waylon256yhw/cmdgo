@@ -134,14 +134,52 @@ Expose port 8080 through your firewall. The proxy token gates all `/v1/*` and `/
 ### VPS — behind a TLS-terminating reverse proxy (recommended)
 
 ```nginx
-location / {
-    proxy_pass http://127.0.0.1:8080;
-    proxy_http_version 1.1;
-    proxy_set_header Connection "";
-    proxy_buffering off;            # required for SSE streaming
-    proxy_read_timeout 1h;          # long-lived dashboard event stream
+# Mask the `token` query parameter in $request before it lands in
+# access logs — the dashboard's EventSource falls back to `?token=…`
+# when it can't set headers, and the proxy token would otherwise be
+# logged in plaintext.
+map $request $request_for_log {
+    "~*^(?<m>\S+)\s+(?<p>[^?\s]+)\?(?<q>\S*\b)token=[^&\s]+(?<r>.*)$"  "$m $p?${q}token=REDACTED$r";
+    default                                                            $request;
+}
+log_format cmdgo '$remote_addr - [$time_local] "$request_for_log" '
+                 '$status $body_bytes_sent "$http_referer" "$http_user_agent"';
+
+server {
+    # ... your TLS / listen blocks ...
+    access_log /var/log/nginx/cmdgo.access.log cmdgo;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;            # required for SSE streaming
+        proxy_read_timeout 1h;          # long-lived dashboard event stream
+    }
+
+    # The dashboard's traffic feed is the only path that sees `?token=`
+    # in practice — turn off access logging here entirely if you'd
+    # rather not depend on the map above.
+    location = /api/events {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_read_timeout 1h;
+        access_log off;
+    }
 }
 ```
+
+> **Security note**: cmdgo accepts the proxy token via three channels
+> — `Authorization: Bearer`, `x-api-key`, and `?token=` (the last is
+> there so browser `EventSource` can authenticate, since it can't set
+> custom headers). cmdgo's own access log records only the path, never
+> the query string, but a typical nginx `$request`-based log captures
+> the full URL. The snippet above either masks `token=…` in the log
+> format or disables access logging for `/api/events`; pick one. If
+> you front cmdgo with a different proxy or a cloud load balancer,
+> apply the equivalent there.
 
 ```bash
 ./cmdgo --listen 127.0.0.1:8080 --public-url https://cmdgo.example.com
