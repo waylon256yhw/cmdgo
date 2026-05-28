@@ -201,6 +201,60 @@ func TestRunnerExhaustsBudgetAndReturnsLastErr(t *testing.T) {
 	}
 }
 
+func TestClassifyOpenError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want FailureClass
+	}{
+		{"context_canceled", context.Canceled, classClient},
+		{"context_deadline", context.DeadlineExceeded, classClient},
+		{"http_401", &cc.APIError{HTTPStatus: 401, Body: cc.APIErrorBody{Code: "UNAUTHORIZED"}}, classAccount},
+		{"http_403", &cc.APIError{HTTPStatus: 403, Body: cc.APIErrorBody{Code: "FORBIDDEN"}}, classAccount},
+		{"http_429", &cc.APIError{HTTPStatus: 429}, classTransient},
+		{"http_502", &cc.APIError{HTTPStatus: 502}, classTransient},
+		{"network_bare", io.ErrUnexpectedEOF, classTransient},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyOpenError(tc.err); got != tc.want {
+				t.Errorf("classifyOpenError(%v) = %s, want %s", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestClassifyStreamError(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want FailureClass
+	}{
+		{
+			"retryable_true",
+			`{"type":"error","error":{"type":"server_error","statusCode":503,"isRetryable":true}}`,
+			classTransient,
+		},
+		{
+			"retryable_false",
+			`{"type":"error","error":{"type":"invalid_request","statusCode":400,"isRetryable":false}}`,
+			classAccount,
+		},
+		{
+			"retryable_unset_5xx_defaults_retry",
+			`{"type":"error","error":{"type":"server_error","statusCode":503}}`,
+			classTransient,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyStreamError(json.RawMessage(tc.raw)); got != tc.want {
+				t.Errorf("classifyStreamError(%s) = %s, want %s", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunnerRetryEachAttemptUsesFreshSID(t *testing.T) {
 	var sids []string
 	r, _, _, cleanup := twoAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {

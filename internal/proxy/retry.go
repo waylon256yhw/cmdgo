@@ -21,6 +21,56 @@ import (
 // total wall-clock cost of all retries is bounded at ~1s.
 var retryBackoffs = []time.Duration{0, 250 * time.Millisecond, 750 * time.Millisecond}
 
+// FailureClass groups upstream failures by what they tell us about the
+// account's health, so the retry path can route each into the right
+// follow-up — only classAccount actually poisons rolling stats.
+//
+//   - classAccount   — the apikey itself is broken (401, INVALID_API_KEY,
+//                      INSUFFICIENT_CREDITS, ACCOUNT_SUSPENDED). MarkError.
+//   - classProtocol  — request is malformed or model not on plan
+//                      (MODEL_NOT_IN_PLAN, INVALID_REQUEST, generic 4xx).
+//                      The account is innocent; propagate to caller.
+//   - classTransient — upstream link wobble (5xx, network, retryable
+//                      stream error). The account is innocent; retry.
+//   - classClient    — client cancelled or its connection died. Nothing
+//                      to retry, nothing to mark.
+//
+// Commit 1 wires the enum and the markError wrapper without changing
+// behaviour (the wrapper currently always calls MarkError). Commit 2
+// gates MarkError on class; Commit 1.5 fills in real classifiers.
+type FailureClass int
+
+const (
+	classAccount FailureClass = iota
+	classProtocol
+	classTransient
+	classClient
+)
+
+func (c FailureClass) String() string {
+	switch c {
+	case classAccount:
+		return "account"
+	case classProtocol:
+		return "protocol"
+	case classTransient:
+		return "transient"
+	case classClient:
+		return "client"
+	}
+	return "unknown"
+}
+
+// markError is the single entry point for poisoning an account's
+// rolling stats. Commit 1 keeps the historic behaviour (always mark)
+// regardless of class — the gating lands in commit 2.
+func markError(p *pool.Pool, accountID string, class FailureClass) {
+	_ = class // gated in commit 2
+	if p != nil {
+		p.MarkError(accountID)
+	}
+}
+
 // UpstreamAttempt is the result of one successful upstream open. The
 // caller owns Response.Body and must close it. FirstEvent is the
 // already-consumed first SSE frame from the stream — the adapter
@@ -96,7 +146,7 @@ func (r *Runner) Execute(ctx context.Context, canon *Canonical) (*UpstreamAttemp
 			Body:      BuildCCBody(canon),
 		})
 		if err != nil {
-			r.Pool.MarkError(acc.ID)
+			markError(r.Pool, acc.ID, classifyOpenError(err))
 			if !shouldRetryError(err) {
 				return nil, err
 			}
@@ -110,7 +160,9 @@ func (r *Runner) Execute(ctx context.Context, canon *Canonical) (*UpstreamAttemp
 		first, sErr := scanner.Next()
 		if sErr != nil && !errors.Is(sErr, io.EOF) {
 			_ = resp.Body.Close()
-			r.Pool.MarkError(acc.ID)
+			// First-read failures are bare I/O errors, not *cc.APIError;
+			// classifyOpenError routes them to classTransient.
+			markError(r.Pool, acc.ID, classifyOpenError(sErr))
 			r.Logger.Warn("upstream first-read failed, will retry",
 				"attempt", attempt+1, "account", acc.ID, "err", sErr)
 			lastErr = sErr
@@ -121,9 +173,10 @@ func (r *Runner) Execute(ctx context.Context, canon *Canonical) (*UpstreamAttemp
 		// instead of a non-2xx HTTP status. Respect its isRetryable
 		// flag.
 		if first != nil && first.Type == "error" {
+			class := classifyStreamError(first.Raw)
 			if isStreamErrorRetryable(first.Raw) {
 				_ = resp.Body.Close()
-				r.Pool.MarkError(acc.ID)
+				markError(r.Pool, acc.ID, class)
 				r.Logger.Warn("upstream stream error (retryable), will retry",
 					"attempt", attempt+1, "account", acc.ID, "raw", truncate(first.Raw, 200))
 				lastErr = fmt.Errorf("upstream stream error: %s", truncate(first.Raw, 200))
@@ -134,7 +187,7 @@ func (r *Runner) Execute(ctx context.Context, canon *Canonical) (*UpstreamAttemp
 			// protocol's error envelope.
 			ae := streamErrorToAPIError(first.Raw)
 			_ = resp.Body.Close()
-			r.Pool.MarkError(acc.ID)
+			markError(r.Pool, acc.ID, class)
 			return nil, ae
 		}
 
@@ -174,6 +227,53 @@ func shouldRetryError(err error) bool {
 	// Bare errors from net/http (dial / read header / connection reset
 	// before reply) are typically transient.
 	return true
+}
+
+// classifyOpenError maps an error from the upstream open (HTTP dial,
+// header read, /alpha/generate non-2xx) into a FailureClass. Commit 1
+// uses a coarse HTTP-status mapping that mirrors the historic "always
+// MarkError on 4xx" behaviour; commit 1.5 reworks this to prioritise
+// CC's message-prefix conventions (MODEL_NOT_IN_PLAN, etc.) so that
+// protocol-level errors stop poisoning account stats.
+func classifyOpenError(err error) FailureClass {
+	if err == nil {
+		// Defensive: callers should not invoke this on success, but
+		// returning classAccount matches the old behaviour of marking.
+		return classAccount
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return classClient
+	}
+	var ae *cc.APIError
+	if errors.As(err, &ae) {
+		switch {
+		case ae.HTTPStatus == http.StatusTooManyRequests:
+			return classTransient
+		case ae.HTTPStatus >= 500 && ae.HTTPStatus < 600:
+			return classTransient
+		case ae.HTTPStatus == http.StatusUnauthorized:
+			return classAccount
+		case ae.HTTPStatus >= 400 && ae.HTTPStatus < 500:
+			// Coarse: every other 4xx looks "account-ish" today.
+			// Commit 1.5 splits MODEL_NOT_IN_PLAN, INVALID_REQUEST out.
+			return classAccount
+		}
+	}
+	// Bare network errors (dial / reset / EOF before headers) are
+	// transient by nature.
+	return classTransient
+}
+
+// classifyStreamError maps a CC-emitted `error` SSE frame to a
+// FailureClass. Commit 1 keys off only the isRetryable flag (mirroring
+// the historic "always MarkError on stream errors" behaviour); commit
+// 1.5 inspects the inner error.type / message prefix to peel protocol
+// errors away from account errors.
+func classifyStreamError(raw json.RawMessage) FailureClass {
+	if isStreamErrorRetryable(raw) {
+		return classTransient
+	}
+	return classAccount
 }
 
 func isStreamErrorRetryable(raw json.RawMessage) bool {
