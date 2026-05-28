@@ -129,6 +129,12 @@ func AccumulateStream(sc eventStream) (*AccumulatedResponse, error) {
 			case "finish":
 				acc.Summary = parseCCFinish(ev.Raw)
 				acc.FinishReceived = true
+				// `finish` is the documented terminal event. Don't wait
+				// for io.EOF — some upstream paths (HTTP/2 mux, nginx
+				// SSE) keep the TCP connection open after the last
+				// frame, which would hang non-streaming SDK calls
+				// indefinitely.
+				return acc, nil
 			case "error":
 				return acc, fmt.Errorf("upstream emitted error event mid-stream: %s", truncate(ev.Raw, 200))
 			}

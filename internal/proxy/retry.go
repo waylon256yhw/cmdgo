@@ -164,11 +164,20 @@ func (r *Runner) Execute(ctx context.Context, canon *Canonical) (*UpstreamAttemp
 			Body:      BuildCCBody(canon),
 		})
 		if err != nil {
+			// markError vs retry are two orthogonal decisions:
+			//   - markError gates on FailureClass (does this prove the
+			//     apikey is broken?).
+			//   - retry gates on plan §9 retryability (would a fresh
+			//     account / session id plausibly succeed?).
+			// They overlap a lot but not always: 429 QUOTA_EXCEEDED is
+			// classAccount (mark this key) AND retryable (a different
+			// account in the pool will probably still serve).
 			class := classifyOpenError(err)
 			markError(r.Pool, acc.ID, class)
-			if class != classTransient {
-				// classClient, classAccount, classProtocol: retry won't
-				// help (cancelled / bad key / bad request). Propagate.
+			if class == classClient {
+				return nil, err
+			}
+			if !shouldRetryError(err) {
 				return nil, err
 			}
 			r.Logger.Warn("upstream open failed, will retry",
@@ -245,6 +254,32 @@ func (r *Runner) Execute(ctx context.Context, canon *Canonical) (*UpstreamAttemp
 		lastErr = errors.New("proxy: retry budget exhausted")
 	}
 	return nil, lastErr
+}
+
+// shouldRetryError encodes plan §9's retry policy for *open* errors
+// (the HTTP-level handshake / non-2xx response from /alpha/generate).
+// It deliberately does not look at FailureClass: a 429 with
+// QUOTA_EXCEEDED is still retryable (the next pool attempt may land
+// on an account that still has quota) even though the *current*
+// account gets marked. classifyOpenError handles the mark decision;
+// this handles the retry decision.
+func shouldRetryError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var ae *cc.APIError
+	if errors.As(err, &ae) {
+		if ae.HTTPStatus == http.StatusTooManyRequests {
+			return true
+		}
+		if ae.HTTPStatus >= 500 && ae.HTTPStatus < 600 {
+			return true
+		}
+		return false
+	}
+	// Bare errors from net/http (dial / read header / connection reset
+	// before reply) are typically transient.
+	return true
 }
 
 // accountMessagePrefixes are the CC-side message prefixes that mean

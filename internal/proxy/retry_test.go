@@ -234,6 +234,81 @@ func TestRunnerExhaustsBudgetAndReturnsLastErr(t *testing.T) {
 	}
 }
 
+func TestPreFlush429QuotaExceededRetriesAndMarks(t *testing.T) {
+	// Per plan §9, HTTP 429 is always retryable. Even when the
+	// message prefix puts the failure into classAccount (this apikey
+	// hit its quota), the runner must mark *this* account and hop to
+	// a different one — the pool's whole point is that a different
+	// account can still serve.
+	r, p, _, cleanup := twoAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		if n == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"success":false,"error":{"code":"TOO_MANY_REQUESTS","status":429,"message":"QUOTA_EXCEEDED: monthly cap hit"}}`)
+			return
+		}
+		writeSSE(w, `{"type":"start"}`, `{"type":"finish","finishReason":"stop","totalUsage":{}}`)
+	})
+	defer cleanup()
+
+	att, err := r.Execute(context.Background(), makeCanon())
+	if err != nil {
+		t.Fatalf("expected retry to recover, got %v", err)
+	}
+	defer att.Response.Body.Close()
+	if !att.Retried {
+		t.Error("Retried=false; 429 must trigger a hop to the second account per plan §9")
+	}
+	total := 0
+	for _, id := range []string{"alpha", "beta"} {
+		_, errs := p.Stats(id)
+		total += errs
+	}
+	if total != 1 {
+		t.Errorf("expected exactly one MarkError (the quota'd account), got %d", total)
+	}
+}
+
+func TestAccumulateStreamReturnsAfterFinish(t *testing.T) {
+	// CC's `finish` event is the documented terminal frame. Streams
+	// that linger after finish (HTTP/2 mux keepalive, intermediary
+	// connection reuse) must not block the non-streaming aggregator.
+	stream := &fakeStream{
+		events: []*cc.StreamEvent{
+			{Type: "text-delta", Raw: json.RawMessage(`{"type":"text-delta","text":"hi"}`)},
+			{Type: "finish", Raw: json.RawMessage(`{"type":"finish","finishReason":"stop","totalUsage":{}}`)},
+		},
+		// Block forever after finish — simulates an upstream that
+		// keeps the SSE channel open. If AccumulateStream waited
+		// for io.EOF instead of returning on finish, this test would
+		// hang the suite.
+		blockAfterExhausted: true,
+	}
+	done := make(chan *AccumulatedResponse, 1)
+	go func() {
+		acc, err := AccumulateStream(stream)
+		if err != nil {
+			t.Errorf("err=%v", err)
+			done <- nil
+			return
+		}
+		done <- acc
+	}()
+	select {
+	case acc := <-done:
+		if acc == nil {
+			t.Fatal("nil accumulator")
+		}
+		if !acc.FinishReceived {
+			t.Error("FinishReceived=false")
+		}
+		if len(acc.Blocks) != 1 || acc.Blocks[0].Text != "hi" {
+			t.Errorf("blocks=%+v", acc.Blocks)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AccumulateStream hung after `finish` — should return immediately on the terminal event")
+	}
+}
+
 // TestAccumulateStreamSharesFinishParse pins the contract that
 // AccumulateStream and the streaming handlers run the same finish
 // parser (parseCCFinish) so token / cost accounting can't diverge
@@ -263,13 +338,20 @@ func TestAccumulateStreamSharesFinishParse(t *testing.T) {
 }
 
 // fakeStream replays a fixed slice of events then returns io.EOF.
+// If blockAfterExhausted is true it blocks indefinitely once the
+// slice runs out — used to assert that callers don't keep reading
+// past terminal events.
 type fakeStream struct {
-	events []*cc.StreamEvent
-	idx    int
+	events              []*cc.StreamEvent
+	idx                 int
+	blockAfterExhausted bool
 }
 
 func (f *fakeStream) Next() (*cc.StreamEvent, error) {
 	if f.idx >= len(f.events) {
+		if f.blockAfterExhausted {
+			select {} // hang
+		}
 		return nil, io.EOF
 	}
 	ev := f.events[f.idx]
