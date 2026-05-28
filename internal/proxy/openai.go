@@ -118,6 +118,42 @@ type openaiToolCallFnDelta struct {
 	Arguments string `json:"arguments,omitempty"`
 }
 
+// openaiCompletion is the non-streaming response shape — distinct
+// from openaiChunk in that each choice carries a complete `message`
+// instead of an incremental `delta`.
+type openaiCompletion struct {
+	ID      string             `json:"id"`
+	Object  string             `json:"object"`
+	Created int64              `json:"created"`
+	Model   string             `json:"model"`
+	Choices []openaiChoiceFull `json:"choices"`
+	Usage   *openaiUsage       `json:"usage,omitempty"`
+}
+
+type openaiChoiceFull struct {
+	Index        int             `json:"index"`
+	Message      openaiMessageOut `json:"message"`
+	FinishReason *string         `json:"finish_reason"`
+}
+
+type openaiMessageOut struct {
+	Role             string              `json:"role"`
+	Content          string              `json:"content"`
+	ReasoningContent string              `json:"reasoning_content,omitempty"`
+	ToolCalls        []openaiToolCallOut `json:"tool_calls,omitempty"`
+}
+
+type openaiToolCallOut struct {
+	ID       string                   `json:"id"`
+	Type     string                   `json:"type"`
+	Function openaiToolCallOutFunction `json:"function"`
+}
+
+type openaiToolCallOutFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
 type openaiUsage struct {
 	PromptTokens            int                  `json:"prompt_tokens"`
 	CompletionTokens        int                  `json:"completion_tokens"`
@@ -207,12 +243,6 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("x-cmdgo-retried", "true")
 	}
 
-	sse, err := NewSSEWriter(w)
-	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "internal_error", err.Error())
-		return
-	}
-
 	// Mark success the moment we have a healthy upstream attempt with
 	// at least one event ready. The apikey is proven valid; the
 	// account is proven reachable. Anything that goes wrong from
@@ -231,9 +261,21 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.Runner.Pool.MarkSuccess(accID)
 	}
 
+	stream := newPrefixedStream(attempt.FirstEvent, attempt.Scanner)
+	wantStream := req.Stream != nil && *req.Stream
+	if !wantStream {
+		h.serveOpenAINonStream(w, stream, accID, req.Model, attempt.Retried, started, rec)
+		return
+	}
+
+	sse, err := NewSSEWriter(w)
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+
 	id := newCompletionID()
 	created := time.Now().Unix()
-	stream := newPrefixedStream(attempt.FirstEvent, attempt.Scanner)
 	var summary streamSummary
 	streamErr := streamCCToOpenAI(h.Logger, stream, sse, id, req.Model, created, &summary)
 	status := http.StatusOK
@@ -262,6 +304,72 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		DurationMS:       int(time.Since(started).Milliseconds()),
 		Retried:          attempt.Retried,
 		ErrorCode:        errCode,
+	})
+}
+
+// serveOpenAINonStream drains the upstream stream into a complete
+// chat-completion JSON response. Used when the request lacks
+// stream=true (the OpenAI SDK's default for client.chat.completions
+// .create()).
+func (h *OpenAIHandler) serveOpenAINonStream(
+	w http.ResponseWriter,
+	stream eventStream,
+	accID, model string,
+	retried bool,
+	started time.Time,
+	rec TrafficRecorder,
+) {
+	acc, err := AccumulateStream(stream)
+	if err != nil {
+		h.Logger.Warn("openai non-stream accumulate error", "err", err, "account", accID)
+		writeOpenAIError(w, http.StatusBadGateway, "stream_error", err.Error())
+		rec.RecordTraffic(store.TrafficEntry{
+			AccountID:  accID,
+			Protocol:   "openai",
+			Model:      model,
+			Status:     http.StatusBadGateway,
+			DurationMS: int(time.Since(started).Milliseconds()),
+			Retried:    retried,
+			ErrorCode:  "stream_error",
+		})
+		return
+	}
+	if !acc.FinishReceived && len(acc.Blocks) == 0 {
+		// Retry budget exhausted upstream of us; surface 502 rather
+		// than fake a "stop" completion. Pairs with retry.go's empty-
+		// stream retry — by the time we get here the pool has already
+		// tried.
+		writeOpenAIError(w, http.StatusBadGateway, "empty_stream", "upstream stream produced no content")
+		rec.RecordTraffic(store.TrafficEntry{
+			AccountID:  accID,
+			Protocol:   "openai",
+			Model:      model,
+			Status:     http.StatusBadGateway,
+			DurationMS: int(time.Since(started).Milliseconds()),
+			Retried:    retried,
+			ErrorCode:  "empty_stream",
+		})
+		return
+	}
+
+	completion := buildOpenAICompletion(acc, newCompletionID(), model, time.Now().Unix())
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(completion)
+
+	_ = h.Store.TouchAccountLastUsed(accID)
+	rec.RecordTraffic(store.TrafficEntry{
+		AccountID:        accID,
+		Protocol:         "openai",
+		Model:            model,
+		Status:           http.StatusOK,
+		InputTokens:      acc.Summary.InputTokens,
+		CacheReadTokens:  acc.Summary.CacheReadTokens,
+		CacheWriteTokens: acc.Summary.CacheWriteTokens,
+		OutputTokens:     acc.Summary.OutputTokens,
+		CostUSD:          computeCostUSD(model, acc.Summary),
+		DurationMS:       int(time.Since(started).Milliseconds()),
+		Retried:          retried,
 	})
 }
 
@@ -364,50 +472,13 @@ func streamCCToOpenAI(logger *slog.Logger, sc eventStream, sse *SSEWriter, id, m
 				}
 				toolIndex++
 			case "finish":
-				var pl struct {
-					FinishReason string `json:"finishReason"`
-					TotalUsage   struct {
-						InputTokens       int `json:"inputTokens"`
-						OutputTokens      int `json:"outputTokens"`
-						TotalTokens       int `json:"totalTokens"`
-						InputTokenDetails struct {
-							CacheReadTokens  int `json:"cacheReadTokens"`
-							CacheWriteTokens int `json:"cacheWriteTokens"`
-							NoCacheTokens    int `json:"noCacheTokens"`
-						} `json:"inputTokenDetails"`
-						OutputTokenDetails struct {
-							TextTokens      int `json:"textTokens"`
-							ReasoningTokens int `json:"reasoningTokens"`
-						} `json:"outputTokenDetails"`
-					} `json:"totalUsage"`
-				}
-				_ = json.Unmarshal(ev.Raw, &pl)
-				fr := normalizeFinishReason(pl.FinishReason)
+				s := parseCCFinish(ev.Raw)
+				fr := normalizeFinishReason(s.FinishReason)
 				if summary != nil {
-					summary.InputTokens = pl.TotalUsage.InputTokens
-					summary.OutputTokens = pl.TotalUsage.OutputTokens
-					summary.CacheReadTokens = pl.TotalUsage.InputTokenDetails.CacheReadTokens
-					summary.CacheWriteTokens = pl.TotalUsage.InputTokenDetails.CacheWriteTokens
-					summary.ReasoningTokens = pl.TotalUsage.OutputTokenDetails.ReasoningTokens
-					summary.FinishReason = pl.FinishReason
-					summary.Recorded = true
+					*summary = s
 				}
-				usage := &openaiUsage{
-					PromptTokens:     pl.TotalUsage.InputTokens,
-					CompletionTokens: pl.TotalUsage.OutputTokens,
-					TotalTokens:      pl.TotalUsage.TotalTokens,
-				}
-				if pl.TotalUsage.InputTokenDetails.CacheReadTokens > 0 {
-					usage.PromptTokensDetails = &openaiTokensDetails{
-						CachedTokens: pl.TotalUsage.InputTokenDetails.CacheReadTokens,
-					}
-				}
-				if pl.TotalUsage.OutputTokenDetails.ReasoningTokens > 0 {
-					usage.CompletionTokensDetails = &openaiTokensDetails{
-						ReasoningTokens: pl.TotalUsage.OutputTokenDetails.ReasoningTokens,
-					}
-				}
-				if werr := sse.WriteJSON(mkChunk(openaiDelta{}, &fr, usage)); werr != nil {
+				usage := openaiUsageFromSummary(s)
+				if werr := sse.WriteJSON(mkChunk(openaiDelta{}, &fr, &usage)); werr != nil {
 					return werr
 				}
 			case "error":
@@ -560,6 +631,85 @@ func firstNonEmptyJSON(candidates ...json.RawMessage) json.RawMessage {
 		}
 	}
 	return nil
+}
+
+// buildOpenAICompletion assembles a non-streaming chat-completion
+// response from an AccumulatedResponse. Tool-only responses get an
+// empty-string content (never null) per the OpenAI spec so clients
+// that key off the type stay happy.
+func buildOpenAICompletion(acc *AccumulatedResponse, id, model string, created int64) *openaiCompletion {
+	var (
+		textParts      []string
+		reasoningParts []string
+		toolCalls      []openaiToolCallOut
+	)
+	for _, b := range acc.Blocks {
+		switch b.Type {
+		case "text":
+			textParts = append(textParts, b.Text)
+		case "thinking":
+			reasoningParts = append(reasoningParts, b.Text)
+		case "tool_use":
+			args := string(b.ToolInputJSON)
+			if args == "" || args == "null" {
+				args = "{}"
+			}
+			toolCalls = append(toolCalls, openaiToolCallOut{
+				ID:   b.ToolID,
+				Type: "function",
+				Function: openaiToolCallOutFunction{
+					Name:      b.ToolName,
+					Arguments: args,
+				},
+			})
+		}
+	}
+	msg := openaiMessageOut{
+		Role:             "assistant",
+		Content:          strings.Join(textParts, ""),
+		ReasoningContent: strings.Join(reasoningParts, ""),
+		ToolCalls:        toolCalls,
+	}
+	finish := normalizeFinishReason(acc.Summary.FinishReason)
+	if !acc.FinishReceived {
+		// Stream truncated without a finish frame; surface that as
+		// "length" so the SDK doesn't claim a clean stop.
+		finish = "length"
+	}
+	usage := openaiUsageFromSummary(acc.Summary)
+	return &openaiCompletion{
+		ID:      id,
+		Object:  "chat.completion",
+		Created: created,
+		Model:   model,
+		Choices: []openaiChoiceFull{{
+			Index:        0,
+			Message:      msg,
+			FinishReason: &finish,
+		}},
+		Usage: &usage,
+	}
+}
+
+// openaiUsageFromSummary projects the protocol-neutral streamSummary
+// onto OpenAI's usage shape. Shared between the streaming finish
+// emitter and the non-streaming response builder.
+func openaiUsageFromSummary(s streamSummary) openaiUsage {
+	u := openaiUsage{
+		PromptTokens:     s.InputTokens,
+		CompletionTokens: s.OutputTokens,
+		TotalTokens:      s.TotalTokens,
+	}
+	if u.TotalTokens == 0 {
+		u.TotalTokens = s.InputTokens + s.OutputTokens
+	}
+	if s.CacheReadTokens > 0 {
+		u.PromptTokensDetails = &openaiTokensDetails{CachedTokens: s.CacheReadTokens}
+	}
+	if s.ReasoningTokens > 0 {
+		u.CompletionTokensDetails = &openaiTokensDetails{ReasoningTokens: s.ReasoningTokens}
+	}
+	return u
 }
 
 func normalizeFinishReason(s string) string {

@@ -19,6 +19,7 @@ type TrafficRecorder interface {
 type streamSummary struct {
 	InputTokens      int
 	OutputTokens     int
+	TotalTokens      int // as reported by CC; usually InputTokens+OutputTokens
 	CacheReadTokens  int
 	CacheWriteTokens int
 	ReasoningTokens  int

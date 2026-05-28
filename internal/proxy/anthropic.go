@@ -140,12 +140,6 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("x-cmdgo-retried", "true")
 	}
 
-	sse, err := NewSSEWriter(w)
-	if err != nil {
-		writeAnthropicError(w, http.StatusInternalServerError, "internal_error", err.Error())
-		return
-	}
-
 	// See the matching comment in openai.go's ServeHTTP: post-flush
 	// errors (mid-stream upstream hiccup, client disconnect) must not
 	// feed Pool.MarkError. The retry.Runner already handles pre-flush
@@ -155,6 +149,19 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stream := newPrefixedStream(attempt.FirstEvent, attempt.Scanner)
+	wantStream := req.Stream != nil && *req.Stream
+	if !wantStream {
+		h.serveAnthropicNonStream(w, stream, accID, req.Model, attempt.Retried, started, rec)
+		_ = affinity
+		return
+	}
+
+	sse, err := NewSSEWriter(w)
+	if err != nil {
+		writeAnthropicError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+
 	var summary streamSummary
 	streamErr := streamCCToAnthropic(h.Logger, stream, sse, newAnthropicMessageID(), req.Model, &summary)
 	status := http.StatusOK
@@ -185,6 +192,114 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ErrorCode:        errCode,
 	})
 	_ = affinity
+}
+
+// serveAnthropicNonStream drains the upstream stream into a complete
+// /v1/messages response. The Anthropic SDK defaults to stream=false.
+func (h *AnthropicHandler) serveAnthropicNonStream(
+	w http.ResponseWriter,
+	stream eventStream,
+	accID, model string,
+	retried bool,
+	started time.Time,
+	rec TrafficRecorder,
+) {
+	acc, err := AccumulateStream(stream)
+	if err != nil {
+		h.Logger.Warn("anthropic non-stream accumulate error", "err", err, "account", accID)
+		writeAnthropicError(w, http.StatusBadGateway, "stream_error", err.Error())
+		rec.RecordTraffic(store.TrafficEntry{
+			AccountID:  accID,
+			Protocol:   "anthropic",
+			Model:      model,
+			Status:     http.StatusBadGateway,
+			DurationMS: int(time.Since(started).Milliseconds()),
+			Retried:    retried,
+			ErrorCode:  "stream_error",
+		})
+		return
+	}
+	if !acc.FinishReceived && len(acc.Blocks) == 0 {
+		writeAnthropicError(w, http.StatusBadGateway, "empty_stream", "upstream stream produced no content")
+		rec.RecordTraffic(store.TrafficEntry{
+			AccountID:  accID,
+			Protocol:   "anthropic",
+			Model:      model,
+			Status:     http.StatusBadGateway,
+			DurationMS: int(time.Since(started).Milliseconds()),
+			Retried:    retried,
+			ErrorCode:  "empty_stream",
+		})
+		return
+	}
+
+	body := buildAnthropicResponse(acc, newAnthropicMessageID(), model)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(body)
+
+	_ = h.Store.TouchAccountLastUsed(accID)
+	rec.RecordTraffic(store.TrafficEntry{
+		AccountID:        accID,
+		Protocol:         "anthropic",
+		Model:            model,
+		Status:           http.StatusOK,
+		InputTokens:      acc.Summary.InputTokens,
+		CacheReadTokens:  acc.Summary.CacheReadTokens,
+		CacheWriteTokens: acc.Summary.CacheWriteTokens,
+		OutputTokens:     acc.Summary.OutputTokens,
+		CostUSD:          computeCostUSD(model, acc.Summary),
+		DurationMS:       int(time.Since(started).Milliseconds()),
+		Retried:          retried,
+	})
+}
+
+// buildAnthropicResponse assembles the full /v1/messages response
+// object from an accumulated stream. Content is always a block array.
+func buildAnthropicResponse(acc *AccumulatedResponse, id, model string) map[string]any {
+	content := make([]map[string]any, 0, len(acc.Blocks))
+	for _, b := range acc.Blocks {
+		switch b.Type {
+		case "text":
+			content = append(content, map[string]any{
+				"type": "text",
+				"text": b.Text,
+			})
+		case "thinking":
+			content = append(content, map[string]any{
+				"type":     "thinking",
+				"thinking": b.Text,
+			})
+		case "tool_use":
+			var input any
+			if len(b.ToolInputJSON) > 0 {
+				_ = json.Unmarshal(b.ToolInputJSON, &input)
+			}
+			if input == nil {
+				input = map[string]any{}
+			}
+			content = append(content, map[string]any{
+				"type":  "tool_use",
+				"id":    b.ToolID,
+				"name":  b.ToolName,
+				"input": input,
+			})
+		}
+	}
+	stopReason := anthropicStopReason(acc.Summary.FinishReason)
+	if !acc.FinishReceived {
+		stopReason = "max_tokens"
+	}
+	return map[string]any{
+		"id":            id,
+		"type":          "message",
+		"role":          "assistant",
+		"content":       content,
+		"model":         model,
+		"stop_reason":   stopReason,
+		"stop_sequence": nil,
+		"usage":         anthropicUsageMapFromSummary(acc.Summary),
+	}
 }
 
 func (h *AnthropicHandler) recorder() TrafficRecorder {
@@ -358,46 +473,17 @@ func streamCCToAnthropic(logger *slog.Logger, sc eventStream, sse *SSEWriter, ms
 				if werr := st.closeCurrent(sse); werr != nil {
 					return werr
 				}
-				var pl struct {
-					FinishReason string `json:"finishReason"`
-					TotalUsage   struct {
-						InputTokens       int `json:"inputTokens"`
-						OutputTokens      int `json:"outputTokens"`
-						TotalTokens       int `json:"totalTokens"`
-						InputTokenDetails struct {
-							CacheReadTokens  int `json:"cacheReadTokens"`
-							CacheWriteTokens int `json:"cacheWriteTokens"`
-							NoCacheTokens    int `json:"noCacheTokens"`
-						} `json:"inputTokenDetails"`
-						OutputTokenDetails struct {
-							TextTokens      int `json:"textTokens"`
-							ReasoningTokens int `json:"reasoningTokens"`
-						} `json:"outputTokenDetails"`
-					} `json:"totalUsage"`
-				}
-				_ = json.Unmarshal(ev.Raw, &pl)
+				s := parseCCFinish(ev.Raw)
 				if summary != nil {
-					summary.InputTokens = pl.TotalUsage.InputTokens
-					summary.OutputTokens = pl.TotalUsage.OutputTokens
-					summary.CacheReadTokens = pl.TotalUsage.InputTokenDetails.CacheReadTokens
-					summary.CacheWriteTokens = pl.TotalUsage.InputTokenDetails.CacheWriteTokens
-					summary.ReasoningTokens = pl.TotalUsage.OutputTokenDetails.ReasoningTokens
-					summary.FinishReason = pl.FinishReason
-					summary.Recorded = true
+					*summary = s
 				}
-				stop := anthropicStopReason(pl.FinishReason)
 				if werr := sse.WriteEvent("message_delta", map[string]any{
 					"type": "message_delta",
 					"delta": map[string]any{
-						"stop_reason":   stop,
+						"stop_reason":   anthropicStopReason(s.FinishReason),
 						"stop_sequence": nil,
 					},
-					"usage": map[string]any{
-						"input_tokens":                pl.TotalUsage.InputTokens,
-						"output_tokens":               pl.TotalUsage.OutputTokens,
-						"cache_read_input_tokens":     pl.TotalUsage.InputTokenDetails.CacheReadTokens,
-						"cache_creation_input_tokens": pl.TotalUsage.InputTokenDetails.CacheWriteTokens,
-					},
+					"usage": anthropicUsageMapFromSummary(s),
 				}); werr != nil {
 					return werr
 				}
@@ -671,6 +757,18 @@ func normalizeAnthropicSystem(raw json.RawMessage) json.RawMessage {
 	}
 	// Unknown shape — pass through and hope CC accepts it.
 	return raw
+}
+
+// anthropicUsageMapFromSummary builds the Anthropic usage map shape
+// shared between the streaming message_delta event and the non-stream
+// response builder.
+func anthropicUsageMapFromSummary(s streamSummary) map[string]any {
+	return map[string]any{
+		"input_tokens":                s.InputTokens,
+		"output_tokens":               s.OutputTokens,
+		"cache_read_input_tokens":     s.CacheReadTokens,
+		"cache_creation_input_tokens": s.CacheWriteTokens,
+	}
 }
 
 func anthropicStopReason(cc string) string {

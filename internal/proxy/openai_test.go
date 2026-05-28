@@ -229,7 +229,7 @@ func TestOpenAIToolCallStream(t *testing.T) {
 	defer srv.Close()
 	h, _ := newOpenAIHandler(t, srv.URL)
 
-	reqBody := `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"weather"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}`
+	reqBody := `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"weather"}],"stream":true,"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -258,6 +258,165 @@ func TestOpenAIToolCallStream(t *testing.T) {
 	}
 	if finishReason != "tool_calls" {
 		t.Errorf("finish_reason=%q, want tool_calls", finishReason)
+	}
+}
+
+func TestOpenAINonStreamReturnsCompleteResponse(t *testing.T) {
+	mock := &mockCCGenerate{t: t, events: []string{
+		`{"type":"start"}`,
+		`{"type":"text-delta","text":"po"}`,
+		`{"type":"text-delta","text":"ng"}`,
+		`{"type":"text-delta","text":"!"}`,
+		`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":7,"outputTokens":3,"totalTokens":10,"inputTokenDetails":{"cacheReadTokens":2,"cacheWriteTokens":0,"noCacheTokens":5},"outputTokenDetails":{"textTokens":3,"reasoningTokens":0}}}`,
+	}}
+	srv := mock.server()
+	defer srv.Close()
+	h, _ := newOpenAIHandler(t, srv.URL)
+
+	// No `stream` field — should default to non-streaming.
+	reqBody := `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"say pong"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type=%q, want application/json (not SSE)", ct)
+	}
+
+	var out openaiCompletion
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode body: %v (body=%s)", err, rr.Body.String())
+	}
+	if out.Object != "chat.completion" {
+		t.Errorf("object=%q, want chat.completion", out.Object)
+	}
+	if len(out.Choices) != 1 {
+		t.Fatalf("choices=%d, want 1", len(out.Choices))
+	}
+	msg := out.Choices[0].Message
+	if msg.Role != "assistant" || msg.Content != "pong!" {
+		t.Errorf("message=%+v, want role=assistant content=\"pong!\"", msg)
+	}
+	if out.Choices[0].FinishReason == nil || *out.Choices[0].FinishReason != "stop" {
+		t.Errorf("finish_reason=%v", out.Choices[0].FinishReason)
+	}
+	if out.Usage == nil || out.Usage.PromptTokens != 7 || out.Usage.CompletionTokens != 3 || out.Usage.TotalTokens != 10 {
+		t.Errorf("usage=%+v", out.Usage)
+	}
+	if out.Usage.PromptTokensDetails == nil || out.Usage.PromptTokensDetails.CachedTokens != 2 {
+		t.Errorf("cached_tokens=%+v", out.Usage.PromptTokensDetails)
+	}
+}
+
+func TestOpenAINonStreamToolCallsContentEmptyString(t *testing.T) {
+	mock := &mockCCGenerate{t: t, events: []string{
+		`{"type":"start"}`,
+		`{"type":"tool-call","toolCallId":"call_abc","toolName":"get_weather","input":{"city":"Tokyo"}}`,
+		`{"type":"finish","finishReason":"tool-calls","totalUsage":{"inputTokens":12,"outputTokens":3,"totalTokens":15,"inputTokenDetails":{},"outputTokenDetails":{}}}`,
+	}}
+	srv := mock.server()
+	defer srv.Close()
+	h, _ := newOpenAIHandler(t, srv.URL)
+
+	reqBody := `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"weather"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var out openaiCompletion
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	msg := out.Choices[0].Message
+	// OpenAI clients trip on `null` content; non-null empty string is
+	// the expected shape when only tool_calls are present.
+	if msg.Content != "" {
+		t.Errorf("content=%q, want empty string", msg.Content)
+	}
+	// Verify the JSON wire form keeps `"content":""` (not null).
+	if !bytes.Contains(rr.Body.Bytes(), []byte(`"content":""`)) {
+		t.Errorf("body missing \"content\":\"\" literal: %s", rr.Body.String())
+	}
+	if len(msg.ToolCalls) != 1 {
+		t.Fatalf("tool_calls count=%d", len(msg.ToolCalls))
+	}
+	tc := msg.ToolCalls[0]
+	if tc.ID != "call_abc" || tc.Type != "function" || tc.Function.Name != "get_weather" {
+		t.Errorf("tool_call=%+v", tc)
+	}
+	if !strings.Contains(tc.Function.Arguments, "Tokyo") {
+		t.Errorf("arguments=%q, want to contain Tokyo", tc.Function.Arguments)
+	}
+	if out.Choices[0].FinishReason == nil || *out.Choices[0].FinishReason != "tool_calls" {
+		t.Errorf("finish_reason=%v", out.Choices[0].FinishReason)
+	}
+}
+
+func TestOpenAINonStreamReasoningContent(t *testing.T) {
+	mock := &mockCCGenerate{t: t, events: []string{
+		`{"type":"start"}`,
+		`{"type":"reasoning-delta","text":"hmm "}`,
+		`{"type":"reasoning-delta","text":"let me think"}`,
+		`{"type":"reasoning-end"}`,
+		`{"type":"text-delta","text":"42"}`,
+		`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":5,"outputTokens":2,"totalTokens":7,"inputTokenDetails":{},"outputTokenDetails":{"reasoningTokens":4}}}`,
+	}}
+	srv := mock.server()
+	defer srv.Close()
+	h, _ := newOpenAIHandler(t, srv.URL)
+
+	reqBody := `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"q"}],"stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out openaiCompletion
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	msg := out.Choices[0].Message
+	if msg.Content != "42" {
+		t.Errorf("content=%q, want \"42\"", msg.Content)
+	}
+	if msg.ReasoningContent != "hmm let me think" {
+		t.Errorf("reasoning_content=%q", msg.ReasoningContent)
+	}
+	if out.Usage == nil || out.Usage.CompletionTokensDetails == nil || out.Usage.CompletionTokensDetails.ReasoningTokens != 4 {
+		t.Errorf("reasoning_tokens=%+v", out.Usage)
+	}
+}
+
+func TestOpenAINonStreamUsageAlwaysPresent(t *testing.T) {
+	// CC returns a finish frame with no usage details (zero values).
+	mock := &mockCCGenerate{t: t, events: []string{
+		`{"type":"text-delta","text":"ok"}`,
+		`{"type":"finish","finishReason":"stop","totalUsage":{}}`,
+	}}
+	srv := mock.server()
+	defer srv.Close()
+	h, _ := newOpenAIHandler(t, srv.URL)
+
+	reqBody := `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"x"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out openaiCompletion
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Usage == nil {
+		t.Fatal("usage is nil; non-stream responses must always include usage")
 	}
 }
 
@@ -396,7 +555,7 @@ func TestOpenAIMidStreamErrorDoesNotPoisonAccount(t *testing.T) {
 		Runner: &Runner{Pool: p, CC: ccClient, Logger: logger},
 	}
 
-	reqBody := `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`
+	reqBody := `{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"hi"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
 	req.Header.Set("Authorization", "Bearer pcc_test")
 	rr := httptest.NewRecorder()

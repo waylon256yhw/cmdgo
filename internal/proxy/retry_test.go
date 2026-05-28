@@ -234,6 +234,49 @@ func TestRunnerExhaustsBudgetAndReturnsLastErr(t *testing.T) {
 	}
 }
 
+// TestAccumulateStreamSharesFinishParse pins the contract that
+// AccumulateStream and the streaming handlers run the same finish
+// parser (parseCCFinish) so token / cost accounting can't diverge
+// between stream=true and stream=false responses.
+func TestAccumulateStreamSharesFinishParse(t *testing.T) {
+	finishRaw := json.RawMessage(`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":17,"outputTokens":4,"totalTokens":21,"inputTokenDetails":{"cacheReadTokens":3,"cacheWriteTokens":1,"noCacheTokens":13},"outputTokenDetails":{"reasoningTokens":2}}}`)
+
+	// Both the streaming and accumulating paths route through
+	// parseCCFinish, so the streamSummary must be byte-for-byte
+	// identical.
+	wantDirect := parseCCFinish(finishRaw)
+
+	stream := &fakeStream{events: []*cc.StreamEvent{
+		{Type: "text-delta", Raw: json.RawMessage(`{"type":"text-delta","text":"x"}`)},
+		{Type: "finish", Raw: finishRaw},
+	}}
+	acc, err := AccumulateStream(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !acc.FinishReceived {
+		t.Error("FinishReceived=false")
+	}
+	if acc.Summary != wantDirect {
+		t.Errorf("Summary mismatch:\n got=%+v\nwant=%+v", acc.Summary, wantDirect)
+	}
+}
+
+// fakeStream replays a fixed slice of events then returns io.EOF.
+type fakeStream struct {
+	events []*cc.StreamEvent
+	idx    int
+}
+
+func (f *fakeStream) Next() (*cc.StreamEvent, error) {
+	if f.idx >= len(f.events) {
+		return nil, io.EOF
+	}
+	ev := f.events[f.idx]
+	f.idx++
+	return ev, nil
+}
+
 func TestClassifyOpenError(t *testing.T) {
 	cases := []struct {
 		name string

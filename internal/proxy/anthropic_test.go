@@ -88,7 +88,7 @@ func TestAnthropicHappyPathStream(t *testing.T) {
 	defer srv.Close()
 	h, _ := newAnthropicHandler(t, srv.URL)
 
-	reqBody := `{"model":"deepseek/deepseek-v4-pro","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"temperature":0.5}`
+	reqBody := `{"model":"deepseek/deepseek-v4-pro","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"stream":true,"temperature":0.5}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
 	req.Header.Set("Authorization", "Bearer pcc_test")
 	req.Header.Set("Content-Type", "application/json")
@@ -167,7 +167,7 @@ func TestAnthropicThinkingBlock(t *testing.T) {
 	defer srv.Close()
 	h, _ := newAnthropicHandler(t, srv.URL)
 
-	reqBody := `{"model":"deepseek/deepseek-v4-pro","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	reqBody := `{"model":"deepseek/deepseek-v4-pro","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -219,7 +219,7 @@ func TestAnthropicToolUseBlock(t *testing.T) {
 	defer srv.Close()
 	h, _ := newAnthropicHandler(t, srv.URL)
 
-	reqBody := `{"model":"deepseek/deepseek-v4-pro","max_tokens":64,"messages":[{"role":"user","content":"weather"}],"tools":[{"name":"get_weather","description":"...","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}]}`
+	reqBody := `{"model":"deepseek/deepseek-v4-pro","max_tokens":64,"messages":[{"role":"user","content":"weather"}],"stream":true,"tools":[{"name":"get_weather","description":"...","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -265,6 +265,110 @@ func TestAnthropicToolUseBlock(t *testing.T) {
 	}
 	if len(sentBody.Params.Tools) != 1 {
 		t.Fatalf("expected 1 tool in upstream body, got %d", len(sentBody.Params.Tools))
+	}
+}
+
+func TestAnthropicNonStreamReturnsBlockArray(t *testing.T) {
+	mock := &mockCCGenerate{t: t, events: []string{
+		`{"type":"start"}`,
+		`{"type":"text-delta","text":"Hello "}`,
+		`{"type":"text-delta","text":"world"}`,
+		`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":8,"outputTokens":2,"totalTokens":10,"inputTokenDetails":{"cacheReadTokens":3,"cacheWriteTokens":1},"outputTokenDetails":{}}}`,
+	}}
+	srv := mock.server()
+	defer srv.Close()
+	h, _ := newAnthropicHandler(t, srv.URL)
+
+	// stream omitted; Anthropic SDK default is non-stream.
+	reqBody := `{"model":"deepseek/deepseek-v4-pro","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type=%q, want application/json", ct)
+	}
+
+	var out struct {
+		ID      string           `json:"id"`
+		Type    string           `json:"type"`
+		Role    string           `json:"role"`
+		Content []map[string]any `json:"content"`
+		Model   string           `json:"model"`
+		Stop    string           `json:"stop_reason"`
+		Usage   map[string]any   `json:"usage"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, rr.Body.String())
+	}
+	if out.Type != "message" || out.Role != "assistant" {
+		t.Errorf("envelope: type=%q role=%q", out.Type, out.Role)
+	}
+	if len(out.Content) != 1 || out.Content[0]["type"] != "text" || out.Content[0]["text"] != "Hello world" {
+		t.Errorf("content=%+v, want single text block \"Hello world\"", out.Content)
+	}
+	if out.Stop != "end_turn" {
+		t.Errorf("stop_reason=%q, want end_turn", out.Stop)
+	}
+	if got, _ := out.Usage["input_tokens"].(float64); int(got) != 8 {
+		t.Errorf("usage.input_tokens=%v", out.Usage["input_tokens"])
+	}
+	if got, _ := out.Usage["cache_read_input_tokens"].(float64); int(got) != 3 {
+		t.Errorf("usage.cache_read_input_tokens=%v", out.Usage["cache_read_input_tokens"])
+	}
+}
+
+func TestAnthropicNonStreamWithThinkingAndToolUse(t *testing.T) {
+	mock := &mockCCGenerate{t: t, events: []string{
+		`{"type":"start"}`,
+		`{"type":"reasoning-delta","text":"thinking..."}`,
+		`{"type":"reasoning-end"}`,
+		`{"type":"text-delta","text":"Calling tool."}`,
+		`{"type":"tool-call","toolCallId":"call_t1","toolName":"do_thing","input":{"x":1}}`,
+		`{"type":"finish","finishReason":"tool-calls","totalUsage":{"inputTokens":6,"outputTokens":4,"totalTokens":10,"inputTokenDetails":{},"outputTokenDetails":{"reasoningTokens":3}}}`,
+	}}
+	srv := mock.server()
+	defer srv.Close()
+	h, _ := newAnthropicHandler(t, srv.URL)
+
+	reqBody := `{"model":"deepseek/deepseek-v4-pro","max_tokens":64,"messages":[{"role":"user","content":"do it"}],"tools":[{"name":"do_thing","input_schema":{"type":"object","properties":{"x":{"type":"integer"}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var out struct {
+		Content []map[string]any `json:"content"`
+		Stop    string           `json:"stop_reason"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Content) != 3 {
+		t.Fatalf("content blocks=%d, want 3 (thinking, text, tool_use): %+v", len(out.Content), out.Content)
+	}
+	// Order should reflect CC's emission order: thinking → text → tool_use.
+	if out.Content[0]["type"] != "thinking" || out.Content[0]["thinking"] != "thinking..." {
+		t.Errorf("block[0]=%+v, want thinking block", out.Content[0])
+	}
+	if out.Content[1]["type"] != "text" || out.Content[1]["text"] != "Calling tool." {
+		t.Errorf("block[1]=%+v, want text block", out.Content[1])
+	}
+	if out.Content[2]["type"] != "tool_use" || out.Content[2]["name"] != "do_thing" || out.Content[2]["id"] != "call_t1" {
+		t.Errorf("block[2]=%+v, want tool_use block", out.Content[2])
+	}
+	inp, _ := out.Content[2]["input"].(map[string]any)
+	if x, _ := inp["x"].(float64); int(x) != 1 {
+		t.Errorf("tool input.x=%v, want 1", inp["x"])
+	}
+	if out.Stop != "tool_use" {
+		t.Errorf("stop_reason=%q, want tool_use", out.Stop)
 	}
 }
 
@@ -504,7 +608,7 @@ func TestAnthropicMidStreamErrorDoesNotPoisonAccount(t *testing.T) {
 		Runner: &Runner{Pool: p, CC: ccClient, Logger: logger},
 	}
 
-	reqBody := `{"model":"deepseek/deepseek-v4-pro","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	reqBody := `{"model":"deepseek/deepseek-v4-pro","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
 	req.Header.Set("x-api-key", "pcc_test")
 	rr := httptest.NewRecorder()
