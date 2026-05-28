@@ -118,9 +118,10 @@ func TestPickSkipsPaused(t *testing.T) {
 }
 
 func TestPickSkipsLowCredits(t *testing.T) {
+	now := time.Now().UTC()
 	st := newStoreWithAccounts(t,
-		store.Account{ID: "low", APIKey: "user_aaa11111", LastKnownCredits: 0.1},
-		store.Account{ID: "ok", APIKey: "user_bbb22222", LastKnownCredits: 5.0},
+		store.Account{ID: "low", APIKey: "user_aaa11111", LastKnownCredits: 0.1, LastKnownCreditsAt: now},
+		store.Account{ID: "ok", APIKey: "user_bbb22222", LastKnownCredits: 5.0, LastKnownCreditsAt: now},
 	)
 	_ = st.Update(func(s *store.State) error {
 		s.Settings.MinCreditsUSD = 0.5
@@ -133,6 +134,52 @@ func TestPickSkipsLowCredits(t *testing.T) {
 	}
 	if got.ID != "ok" {
 		t.Errorf("got %q, want ok (low has 0.1 < threshold 0.5)", got.ID)
+	}
+}
+
+func TestPickFiltersKnownZeroCredits(t *testing.T) {
+	// Account with credits genuinely zero — billing succeeded recently
+	// and reported $0. Should be filtered out under MinCreditsUSD>0.
+	now := time.Now().UTC()
+	st := newStoreWithAccounts(t,
+		store.Account{ID: "zero", APIKey: "user_zero11111", LastKnownCredits: 0, LastKnownCreditsAt: now},
+		store.Account{ID: "ok", APIKey: "user_okok22222", LastKnownCredits: 5.0, LastKnownCreditsAt: now},
+	)
+	_ = st.Update(func(s *store.State) error {
+		s.Settings.MinCreditsUSD = 0.5
+		return nil
+	})
+	p := New(st)
+	for i := 0; i < 5; i++ {
+		got, err := p.Pick(PickOptions{ClientToken: "tok" + string(rune('a'+i)), Model: "m"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID == "zero" {
+			t.Errorf("iteration %d: known-zero account leaked into candidates", i)
+		}
+	}
+}
+
+func TestPickIncludesUnknownCredits(t *testing.T) {
+	// Account just added with billing failing — LastKnownCreditsAt is
+	// zero, LastKnownCredits is 0, but credits are unknown not known-
+	// zero. Pool.Pick must NOT filter it: pool/sync.go will eventually
+	// stamp a real value.
+	st := newStoreWithAccounts(t,
+		store.Account{ID: "unknown", APIKey: "user_unknown11"},
+	)
+	_ = st.Update(func(s *store.State) error {
+		s.Settings.MinCreditsUSD = 0.5
+		return nil
+	})
+	p := New(st)
+	got, err := p.Pick(PickOptions{ClientToken: "tok", Model: "m"})
+	if err != nil {
+		t.Fatalf("Pick on a never-synced account returned err=%v; expected the account to be eligible until the syncer stamps a balance", err)
+	}
+	if got.ID != "unknown" {
+		t.Errorf("got %q, want unknown", got.ID)
 	}
 }
 

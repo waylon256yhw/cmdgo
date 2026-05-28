@@ -65,10 +65,19 @@ func (p *Pool) Pick(opts PickOptions) (*store.Account, error) {
 		if acc.Paused || acc.APIKey == "" {
 			continue
 		}
-		if settings.MinCreditsUSD > 0 && acc.LastKnownCredits > 0 && acc.LastKnownCredits < settings.MinCreditsUSD {
+		if opts.Exclude[acc.ID] {
 			continue
 		}
-		if opts.Exclude[acc.ID] {
+		// Filter on the minimum-credits floor only when we have actually
+		// observed a balance for this account. LastKnownCreditsAt is
+		// stamped on every successful BillingCredits call (oauth add,
+		// 60s sync); a zero timestamp means we've never seen one, so
+		// the account is "unknown credits" rather than "known $0" and
+		// gets a chance to serve a request. Without this distinction,
+		// a billing endpoint blip at add time would permanently mark
+		// a freshly-added account as low-balance.
+		credentialsKnown := !acc.LastKnownCreditsAt.IsZero()
+		if settings.MinCreditsUSD > 0 && credentialsKnown && acc.LastKnownCredits < settings.MinCreditsUSD {
 			continue
 		}
 		if p.errorRate(acc.ID) > settings.MaxErrorRate5min && settings.MaxErrorRate5min > 0 {

@@ -202,10 +202,13 @@ func (s *OAuthService) addAccount(ctx context.Context, apikey string) (*store.Ac
 		return nil, false, fmt.Errorf("whoami: %w", err)
 	}
 	credits, err := s.CC.BillingCredits(verifyCtx, apikey)
-	if err != nil {
-		// We have a valid user but the billing endpoint failed. Persist
-		// the account anyway with zero credits; the 60s sync in commit 6
-		// will refresh.
+	billingOK := err == nil
+	if !billingOK {
+		// Persist the account anyway with credits unknown. Critically
+		// we must NOT stamp LastKnownCreditsAt — pool.Pick uses it to
+		// distinguish "real $0 balance" from "billing endpoint never
+		// responded". The 60s sync (pool/sync.go) will fill it in
+		// once the upstream recovers.
 		s.Logger.Warn("billing credits unavailable at add time",
 			"account_id", user.ID,
 			"err", err,
@@ -224,21 +227,32 @@ func (s *OAuthService) addAccount(ctx context.Context, apikey string) (*store.Ac
 				st.Accounts[i].Name = user.Name
 				st.Accounts[i].Email = user.Email
 				st.Accounts[i].UserName = user.UserName
-				st.Accounts[i].LastKnownCredits = credits.Total()
-				st.Accounts[i].LastKnownCreditsAt = now
+				// On refresh, only overwrite the known-credits pair when
+				// billing succeeded. If it failed, the old known values
+				// stay put — a transient billing blip should not turn a
+				// healthy account into "unknown" or "$0".
+				if billingOK {
+					st.Accounts[i].LastKnownCredits = credits.Total()
+					st.Accounts[i].LastKnownCreditsAt = now
+				}
 				saved = st.Accounts[i]
 				return nil
 			}
 		}
 		acc := store.Account{
-			ID:                 user.ID,
-			Name:               user.Name,
-			Email:              user.Email,
-			UserName:           user.UserName,
-			APIKey:             apikey,
-			AddedAt:            now,
-			LastKnownCredits:   credits.Total(),
-			LastKnownCreditsAt: now,
+			ID:               user.ID,
+			Name:             user.Name,
+			Email:            user.Email,
+			UserName:         user.UserName,
+			APIKey:           apikey,
+			AddedAt:          now,
+			LastKnownCredits: credits.Total(),
+		}
+		if billingOK {
+			// Only stamp the timestamp when we actually know the balance.
+			// Zero LastKnownCreditsAt is the "unknown" marker that
+			// pool.Pick reads to give a never-synced account a chance.
+			acc.LastKnownCreditsAt = now
 		}
 		st.Accounts = append(st.Accounts, acc)
 		saved = acc

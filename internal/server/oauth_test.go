@@ -66,6 +66,137 @@ func newOAuthService(t *testing.T, ccURL string) (*OAuthService, *store.Store) {
 	}, st
 }
 
+// mockCCBillingFails serves /alpha/whoami like mockCC but returns 500
+// from /alpha/billing/credits. Used to verify that addAccount persists
+// the row but leaves LastKnownCreditsAt zero, so pool.Pick treats the
+// account as "credits unknown" rather than "known $0".
+func mockCCBillingFails(t *testing.T, apikey string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/alpha/whoami", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+apikey {
+			http.Error(w, `{"success":false,"error":{"code":"UNAUTHORIZED","status":401}}`, http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"user": map[string]any{
+				"id":       "00000000-0000-0000-0000-billingfail0",
+				"name":     "Test User",
+				"userName": "tester",
+			},
+		})
+	})
+	mux.HandleFunc("/alpha/billing/credits", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"success":false,"error":{"code":"INTERNAL","status":500,"message":"upstream down"}}`)
+	})
+	return httptest.NewServer(mux)
+}
+
+func TestAddAccountBillingFailureLeavesTimestampZero(t *testing.T) {
+	const apikey = "user_billingfailnew0"
+	srv := mockCCBillingFails(t, apikey)
+	defer srv.Close()
+	oa, st := newOAuthService(t, srv.URL)
+
+	body, _ := json.Marshal(pasteKeyRequest{APIKey: apikey})
+	req := httptest.NewRequest(http.MethodPost, "/api/oauth/paste-key", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	oa.HandlePasteKey(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	snap := st.Snapshot()
+	if len(snap.Accounts) != 1 {
+		t.Fatalf("accounts=%d, want 1", len(snap.Accounts))
+	}
+	acc := snap.Accounts[0]
+	if acc.LastKnownCredits != 0 {
+		t.Errorf("LastKnownCredits=%v, want 0 (billing failed)", acc.LastKnownCredits)
+	}
+	if !acc.LastKnownCreditsAt.IsZero() {
+		t.Errorf("LastKnownCreditsAt=%v, want zero — pool.Pick relies on this to distinguish unknown from $0",
+			acc.LastKnownCreditsAt)
+	}
+}
+
+func TestRefreshAccountBillingFailurePreservesOldCredits(t *testing.T) {
+	const apikey = "user_billingfailref0"
+
+	// First insert with billing OK so we have a known balance.
+	srv1 := mockCC(t, apikey)
+	defer srv1.Close()
+	oa, st := newOAuthService(t, srv1.URL)
+	mockCCID := "00000000-0000-0000-0000-deadbeef0001"
+	body, _ := json.Marshal(pasteKeyRequest{APIKey: apikey})
+	req := httptest.NewRequest(http.MethodPost, "/api/oauth/paste-key", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	oa.HandlePasteKey(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("first insert: status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	snap := st.Snapshot()
+	if len(snap.Accounts) != 1 {
+		t.Fatalf("after insert accounts=%d, want 1", len(snap.Accounts))
+	}
+	before := snap.Accounts[0]
+	if before.ID != mockCCID || before.LastKnownCredits != 9.42 || before.LastKnownCreditsAt.IsZero() {
+		t.Fatalf("baseline mismatch: %+v", before)
+	}
+
+	// Now swap to a billing-fails server and re-add the same apikey.
+	// The CC user id matches so addAccount takes the refresh branch.
+	srv2 := mockCC2WithBrokenBilling(t, apikey, mockCCID)
+	defer srv2.Close()
+	oa.CC = cc.NewWithBaseURL(srv2.URL)
+
+	req = httptest.NewRequest(http.MethodPost, "/api/oauth/paste-key", bytes.NewReader(body))
+	rr = httptest.NewRecorder()
+	oa.HandlePasteKey(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("refresh: status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	after := st.Snapshot().Accounts[0]
+	if after.LastKnownCredits != before.LastKnownCredits {
+		t.Errorf("refresh stomped credits: before=%v after=%v (billing blip should not zero a healthy account)",
+			before.LastKnownCredits, after.LastKnownCredits)
+	}
+	if !after.LastKnownCreditsAt.Equal(before.LastKnownCreditsAt) {
+		t.Errorf("refresh moved timestamp: before=%v after=%v", before.LastKnownCreditsAt, after.LastKnownCreditsAt)
+	}
+}
+
+// mockCC2WithBrokenBilling serves whoami with a caller-supplied user
+// id so refresh paths can match a previously-persisted account.
+func mockCC2WithBrokenBilling(t *testing.T, apikey, userID string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/alpha/whoami", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+apikey {
+			http.Error(w, `{"success":false,"error":{"code":"UNAUTHORIZED"}}`, http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"user": map[string]any{
+				"id":       userID,
+				"name":     "Test User",
+				"userName": "tester",
+			},
+		})
+	})
+	mux.HandleFunc("/alpha/billing/credits", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"success":false,"error":{"code":"INTERNAL","status":500}}`)
+	})
+	return httptest.NewServer(mux)
+}
+
 func TestPasteKeyAddsAccount(t *testing.T) {
 	const apikey = "user_pastekeyhappy123"
 	srv := mockCC(t, apikey)
