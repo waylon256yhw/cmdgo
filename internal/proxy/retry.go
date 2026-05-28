@@ -130,16 +130,25 @@ func (r *Runner) Execute(ctx context.Context, canon *Canonical) (*UpstreamAttemp
 			}
 		}
 
-		acc, err := r.Pool.Pick(pool.PickOptions{
+		pickOpts := pool.PickOptions{
 			ClientToken:    canon.ClientToken,
 			Model:          canon.Model,
 			MessagesPrefix: prefix,
 			Exclude:        tried,
-		})
+		}
+		acc, err := r.Pool.Pick(pickOpts)
+		if errors.Is(err, pool.ErrNoHealthyAccount) && len(tried) > 0 {
+			// Single-account (or fully-exhausted-pool) deployments would
+			// otherwise burn the rest of the retry budget here. Clear
+			// the Exclude set and try again — the fresh x-session-id
+			// (already keyed off attempt index in SessionID below) makes
+			// CC route us to a different upstream pod, which is what
+			// retries are really for.
+			tried = make(map[string]bool)
+			pickOpts.Exclude = tried
+			acc, err = r.Pool.Pick(pickOpts)
+		}
 		if err != nil {
-			// Out of healthy accounts mid-retry — surface the failure
-			// from the first failed attempt if we had one, since it's
-			// more diagnostic than "no healthy account".
 			if lastErr != nil {
 				return nil, lastErr
 			}

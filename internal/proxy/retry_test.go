@@ -55,6 +55,37 @@ func twoAccountSetup(t *testing.T, handle func(int, *http.Request, http.Response
 	return r, p, st, srv.Close
 }
 
+// oneAccountSetup is twoAccountSetup's single-account sibling — useful
+// for exercising the "no alternative account" path in Runner.Execute.
+func oneAccountSetup(t *testing.T, handle func(int, *http.Request, http.ResponseWriter)) (*Runner, *pool.Pool, *store.Store, func()) {
+	t.Helper()
+	var calls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/alpha/generate", func(w http.ResponseWriter, r *http.Request) {
+		n := int(calls.Add(1))
+		handle(n, r, w)
+	})
+	srv := httptest.NewServer(mux)
+
+	st, err := store.New(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Update(func(s *store.State) error {
+		s.Accounts = []store.Account{
+			{ID: "solo", APIKey: "user_solo111111", LastKnownCredits: 9},
+		}
+		return nil
+	})
+	p := pool.New(st)
+	r := &Runner{
+		Pool:   p,
+		CC:     cc.NewWithBaseURL(srv.URL),
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	return r, p, st, srv.Close
+}
+
 func writeSSE(w http.ResponseWriter, frames ...string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
@@ -421,6 +452,57 @@ func TestPreFlushInvalidAPIKeyMarksError(t *testing.T) {
 	}
 	if total != 1 {
 		t.Errorf("expected exactly 1 MarkError across both accounts, got %d", total)
+	}
+}
+
+func TestSingleAccountRetryRecovers(t *testing.T) {
+	var sids []string
+	r, p, _, cleanup := oneAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		sids = append(sids, req.Header.Get("X-Session-Id"))
+		if n == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"success":false,"error":{"code":"BAD_GATEWAY","status":502,"message":"upstream sad"}}`)
+			return
+		}
+		writeSSE(w, `{"type":"start"}`, `{"type":"finish","finishReason":"stop","totalUsage":{}}`)
+	})
+	defer cleanup()
+
+	att, err := r.Execute(context.Background(), makeCanon())
+	if err != nil {
+		t.Fatalf("single-account retry failed to recover: %v", err)
+	}
+	defer att.Response.Body.Close()
+	if !att.Retried {
+		t.Error("Retried=false; expected retry on a single account")
+	}
+	if len(sids) < 2 || sids[0] == sids[1] {
+		t.Errorf("expected distinct session ids across attempts, got %v", sids)
+	}
+	// Transient 502 must not have marked the only account.
+	if _, errs := p.Stats("solo"); errs != 0 {
+		t.Errorf("solo account: errs=%d, want 0", errs)
+	}
+}
+
+func TestSingleAccountRetryAllFail(t *testing.T) {
+	var attempts atomic.Int32
+	r, _, _, cleanup := oneAccountSetup(t, func(n int, req *http.Request, w http.ResponseWriter) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"success":false,"error":{"code":"FAULT","status":503,"message":"down"}}`)
+	})
+	defer cleanup()
+
+	_, err := r.Execute(context.Background(), makeCanon())
+	if err == nil {
+		t.Fatal("expected error after exhausting retry budget")
+	}
+	if errors.Is(err, pool.ErrNoHealthyAccount) {
+		t.Fatalf("got ErrNoHealthyAccount — the single account was self-excluded, want the upstream 503 error")
+	}
+	if got := attempts.Load(); int(got) != len(retryBackoffs) {
+		t.Errorf("attempts=%d, want %d (full retry budget should be spent on the solo account)", got, len(retryBackoffs))
 	}
 }
 
