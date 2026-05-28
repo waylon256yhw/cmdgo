@@ -89,7 +89,7 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	tools := convertAnthropicTools(req.Tools)
 
-	clientToken := extractBearer(r)
+	clientToken := extractClientToken(r)
 	// Per plan §11, metadata.user_id wins as the affinity key over the
 	// bearer when present — it lets multiple end users of one shared
 	// dashboard get sticky routing without sharing an account.

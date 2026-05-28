@@ -200,7 +200,7 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientToken := extractBearer(r)
+	clientToken := extractClientToken(r)
 	canon := &Canonical{
 		Model:       req.Model,
 		Messages:    messages,
@@ -754,12 +754,21 @@ func mapCCErrorToOpenAI(w http.ResponseWriter, err error) {
 	writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
 }
 
-func extractBearer(r *http.Request) string {
-	h := r.Header.Get("Authorization")
-	if strings.HasPrefix(h, "Bearer ") {
+// extractClientToken returns the value that should drive affinity
+// routing — i.e. the same proxy token the middleware authenticated
+// against. It mirrors server.extractProxyToken's lookup order so an
+// Anthropic SDK call (x-api-key) and an OpenAI SDK call
+// (Authorization: Bearer) for the same user hash onto the same
+// account. Used only as input to the affinity hash; the auth gate
+// has already run by the time a handler is invoked.
+func extractClientToken(r *http.Request) string {
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return h[len("Bearer "):]
 	}
-	return ""
+	if h := r.Header.Get("x-api-key"); h != "" {
+		return h
+	}
+	return r.URL.Query().Get("token")
 }
 
 func collectIgnoredOpenAIFields(req *openaiRequest) []string {

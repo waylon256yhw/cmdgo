@@ -420,6 +420,110 @@ func TestOpenAINonStreamUsageAlwaysPresent(t *testing.T) {
 	}
 }
 
+func TestExtractClientTokenFallbacks(t *testing.T) {
+	const want = "pcc_aff1n1ty_test_token"
+
+	cases := []struct {
+		name string
+		setup func(r *http.Request)
+	}{
+		{"authorization_bearer", func(r *http.Request) {
+			r.Header.Set("Authorization", "Bearer "+want)
+		}},
+		{"x_api_key_header", func(r *http.Request) {
+			r.Header.Set("x-api-key", want)
+		}},
+		{"query_token", func(r *http.Request) {
+			q := r.URL.Query()
+			q.Set("token", want)
+			r.URL.RawQuery = q.Encode()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
+			tc.setup(req)
+			if got := extractClientToken(req); got != want {
+				t.Errorf("extractClientToken=%q, want %q (so affinity hashes consistently across auth modes)", got, want)
+			}
+		})
+	}
+
+	// Authorization Bearer beats x-api-key when both are set — matches
+	// server.extractProxyToken's order so the affinity key matches the
+	// auth token.
+	t.Run("authorization_wins_over_xapikey", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
+		req.Header.Set("Authorization", "Bearer first_token")
+		req.Header.Set("x-api-key", "second_token")
+		if got := extractClientToken(req); got != "first_token" {
+			t.Errorf("extractClientToken=%q, want first_token", got)
+		}
+	})
+}
+
+// TestOpenAIAffinityRoutesXAPIKeyAndBearerToSameAccount runs two
+// requests against the same handler — one carrying the affinity
+// token via Authorization, one via x-api-key — and asserts they
+// land on the same upstream account. With the previous extractBearer
+// behaviour the x-api-key request would hash with ClientToken=""
+// and could land on a different shard.
+func TestOpenAIAffinityRoutesXAPIKeyAndBearerToSameAccount(t *testing.T) {
+	var seenAuthHeaders []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/alpha/generate", func(w http.ResponseWriter, r *http.Request) {
+		seenAuthHeaders = append(seenAuthHeaders, r.Header.Get("Authorization"))
+		writeSSE(w, `{"type":"start"}`, `{"type":"finish","finishReason":"stop","totalUsage":{}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	st, err := store.New(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Update(func(s *store.State) error {
+		s.Accounts = []store.Account{
+			{ID: "alpha", APIKey: "user_alpha", LastKnownCredits: 9},
+			{ID: "beta", APIKey: "user_beta", LastKnownCredits: 9},
+			{ID: "gamma", APIKey: "user_gamma", LastKnownCredits: 9},
+		}
+		return nil
+	})
+	p := pool.New(st)
+	ccClient := cc.NewWithBaseURL(srv.URL)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := &OpenAIHandler{
+		Store:  st,
+		CC:     ccClient,
+		Logger: logger,
+		Runner: &Runner{Pool: p, CC: ccClient, Logger: logger},
+	}
+
+	send := func(setAuth func(r *http.Request)) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+			strings.NewReader(`{"model":"deepseek/deepseek-v4-pro","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+		setAuth(req)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+		}
+	}
+
+	const aff = "pcc_same_token_for_both"
+	send(func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+aff) })
+	send(func(r *http.Request) { r.Header.Set("x-api-key", aff) })
+
+	if len(seenAuthHeaders) != 2 {
+		t.Fatalf("got %d upstream calls, want 2", len(seenAuthHeaders))
+	}
+	if seenAuthHeaders[0] != seenAuthHeaders[1] {
+		t.Errorf("affinity routing failed: bearer landed on %q, x-api-key landed on %q",
+			seenAuthHeaders[0], seenAuthHeaders[1])
+	}
+}
+
 func TestOpenAINoHealthyAccount(t *testing.T) {
 	h, st := newOpenAIHandler(t, "http://unreachable.local")
 	_ = st.Update(func(s *store.State) error {
